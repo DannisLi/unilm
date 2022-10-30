@@ -30,7 +30,7 @@ def convert_csv_to_dict(args):
             if f != 'dataset.csv':
                 continue
             print('Now converting', d + '/' + f)
-            raw_data = list(csv.DictReader(open(osp.join(d, f))))
+            raw_data = list(csv.DictReader(open(osp.join(d, f), "r", encoding="utf8")))
             curr_domain = d.split('/')[-2]
             if last_domain != curr_domain and last_domain is not None:
                 domain = {'domain': last_domain, 'websites': websites}

@@ -400,7 +400,9 @@ def main():
     parser.add_argument('--eval_to_checkpoint', type=int, default=None,
                         help="Only evaluate the checkpoints with prefix smaller than it, beside the final checkpoint "
                              "with no prefix")
-
+    
+    parser.add_argument("--dataloader_workers", default=8, type=int,
+                        help="Number of dataloader worker for evaluation.")
     parser.add_argument("--per_gpu_train_batch_size", default=8, type=int,
                         help="Batch size per GPU/CPU for training.")
     parser.add_argument("--per_gpu_eval_batch_size", default=8, type=int,
