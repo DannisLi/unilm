@@ -1123,3 +1123,108 @@ def create_position_ids_from_input_ids(input_ids, padding_idx, past_key_values_l
     mask = input_ids.ne(padding_idx).int()
     incremental_indices = (torch.cumsum(mask, dim=1).type_as(mask) + past_key_values_length) * mask
     return incremental_indices.long() + padding_idx
+
+
+class MarkupLMForNodeClassification(MarkupLMPreTrainedModel):
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.hidden_size = config.hidden_size
+        self.num_labels = config.num_labels
+
+        self.markuplm = MarkupLMModel(config, add_pooling_layer=False)
+        self.classifiers = nn.ModuleList([self.build_classifier() for _ in range(config.num_hidden_layers)])
+        self.loss_fct = CrossEntropyLoss()
+
+        self.init_weights()
+    
+    def build_classifier(self):
+        return nn.Sequential(
+            nn.Linear(self.hidden_size, self.hidden_size),
+            nn.GELU(),
+            nn.Linear(self.hidden_size, self.hidden_size),
+            nn.GELU(),
+            nn.Linear(self.hidden_size, self.num_labels),
+        )
+
+
+    def forward(
+            self,
+            input_ids=None,
+            attention_mask=None,
+            token_type_ids=None,
+            position_ids=None,
+            head_mask=None,
+            inputs_embeds=None,
+            num_nodes=None,
+            node_boundaries=None,
+            node_labels=None,
+            question_boundaries=None,
+            output_attentions=None,
+            output_hidden_states=None,
+            return_dict=None,
+            xpath_tags_seq=None,
+            xpath_subs_seq=None,
+        ):
+        '''
+        num_nodes[bs]: the number of DOM nodes
+        node_labels[bs*max_num_nodes]: the labels of DOM nodes, i.e. whether contain answers (exactly)
+        node_boundaries[bs*max_num_nodes*2]: the boundaries of DOM nodes
+        question_boundaries[bs*2]: the boundaries of questions
+        '''
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        outputs = self.markuplm(
+            input_ids,
+            xpath_tags_seq=xpath_tags_seq,
+            xpath_subs_seq=xpath_subs_seq,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=True,    # 返回每层的hidden states，以便让每层的表征过分类器
+            return_dict=return_dict,
+        )
+
+        hidden_states = outputs.hidden_states[1:]
+        max_num_nodes = node_labels.shape[1]
+        batch_size = node_labels.shape[0]
+
+        logits, loss = [], []
+
+        for lno, hidden_states_layer in enumerate(hidden_states):
+            # hidden_states_layer: [bs*max_seq_len*dim]
+            # 计算节点表征(avg pooling)
+            node_representations = []
+            for b in range(batch_size):
+                num_nodes_case = num_nodes[b]
+                node_boundaries_case = node_noundaries[b]
+                node_representations_case = torch.stack([
+                    hidden_states_layer[b, node_boundaries_case[j,0]:node_boundaries_case[j,1]].mean(dim=1) for j in range(num_nodes_case)], dim=0)
+                # pad [num_nodes*dim] to [max_num_nodes*dim]
+                if max_num_nodes > num_nodes_case:
+                    node_representations_case = torch.cat(
+                        (node_representations_case, torch.zeros(max_num_nodes-num_nodes_case, self.hidden_size)), dim=0)
+                # put into
+                node_representations.append(node_representations_case)
+            # stack list to tensor [bs*max_num_nodes*dim]
+            node_representations = torch.stack(node_representations)
+            
+            # 计算节点分类(MLP classifier)
+            logits_layer = self.classifiers[lno](node_representations)    # [bs*max_num_nodes*num_labels]
+
+            # 计算分类损失(CE Loss)
+            loss_layer = self.loss_fct(logits_layer.view(-1, self.num_labels), node_labels.view(-1, 1))
+
+            logits.append(logits_layer)
+            loss.append(loss_layer)
+
+        logits = torch.stack(logits, dim=0)    # [layers*bs*max_num_nodes*num_labels]
+        logits.transpose(0, 1)                 # [bs*layers*max_num_nodes*num_labels]
+        loss = torch.stack(loss, dim=0)        # [layers]
+        loss.unsqueeze(0)                      # [1*layers]
+
+        return logits, loss
+
