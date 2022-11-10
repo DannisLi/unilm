@@ -1,0 +1,12 @@
+CUDA_VISIBLE_DEVICES=0,1 python run.py \
+	--train_file /Path/To/WebSRC/websrc1.0_train_.json \
+	--predict_file /Path/To/WebSRC/websrc1.0_dev_.json \
+	--root_dir /Path/To/WebSRC \
+	--model_name_or_path microsoft/markuplm-large \
+	--output_dir /Your/Output/Path \
+	--do_train \
+	--do_eval \
+	--eval_all_checkpoints \
+	--per_gpu_train_batch_size 8 \
+	--warmup_ratio 0.1 \
+	--num_train_epochs 5
