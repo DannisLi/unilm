@@ -384,8 +384,8 @@ def read_squad_examples(input_file, root_dir, is_training, tokenizer, simplify=F
                 html_code = bs(html_file, "html.parser")
                 raw_text_list, tag_num = html_to_text_list(html_code)  # 字符列表及标签数
 
-                doc_tokens = []
-                char_to_word_offset = []
+                doc_tokens = []    # list of str, HTML中每段文本按照whitespace分开
+                char_to_word_offset = []    # list of index, page_text中每个字符对应到doc_tokens中token的index
 
                 page_text = ' '.join(raw_text_list)
                 prev_is_whitespace = True
@@ -418,9 +418,9 @@ def read_squad_examples(input_file, root_dir, is_training, tokenizer, simplify=F
                 else:
                     # Tokenize all doc tokens
                     # tokenize sth like < / >
-                    tok_to_orig_index = []
-                    orig_to_tok_index = []
-                    all_doc_tokens = []
+                    tok_to_orig_index = []    # all_doc_tokens中的token对应doc_tokens中的index
+                    orig_to_tok_index = []    # doc_tokens中的token对应all_doc_tokens中起始的index
+                    all_doc_tokens = []    # doc_tokens中的tokens不符合MarkupLM的词典，需要分解为符合字典的sub-tokens
                     for (i, token) in enumerate(doc_tokens):
                         orig_to_tok_index.append(len(all_doc_tokens))
                         if token in tag_list:
@@ -432,20 +432,25 @@ def read_squad_examples(input_file, root_dir, is_training, tokenizer, simplify=F
                             all_doc_tokens.append(sub_token)
 
                     # Generate extra information for features
-                    tok_to_tags_index, unique_tids = subtoken_tag_offset(html_code, tok_to_orig_index)
+                    tok_to_tags_index, unique_tids = subtoken_tag_offset(html_code, tok_to_orig_index)    # all_doc_tokens中每个token对应的tid
 
+                    # tid对应的tag seq和subscript seq
                     xpath_tag_map, xpath_subs_map = get_xpath_and_treeid4tokens(html_code,
                                                                                 unique_tids,
                                                                                 max_depth=max_depth)
 
                     assert tok_to_tags_index[-1] == tag_num - 1, (tok_to_tags_index[-1], tag_num - 1)
 
+                    # build node_spans: tid: [start, end], index按照all_doc_tokens计算
+                    node_spans = {}
+                    
+
                     # Process each qas, which is mainly calculate the answer position
                     for qa in website["qas"]:
                         qas_id = qa["id"]
                         question_text = qa["question"]
-                        start_position = None
-                        end_position = None
+                        start_position = None    # answer在doc_tokens中的起始位置
+                        end_position = None      # answer在doc_tokens中的终止位置
                         orig_answer_text = None
 
                         if is_training:
@@ -476,6 +481,15 @@ def read_squad_examples(input_file, root_dir, is_training, tokenizer, simplify=F
                                 logger.warning("Could not find answer of question %s: '%s' vs. '%s'",
                                                qa['id'], actual_text, cleaned_answer_text)
                                 continue
+                            # print ("html_fn:", html_fn)
+                            # print ("doc_tokens:", doc_tokens)
+                            # print ("all_doc_tokens:", all_doc_tokens)
+                            # print ("orig_answer_text:", orig_answer_text)
+                            # print ("answer_length:", answer_length)
+                            # print ("start_position:", start_position)
+                            # print ("end_position:", end_position)
+                            # print ()
+                            # print ()
 
                         example = SRCExample(
                             doc_tokens=doc_tokens,
@@ -544,10 +558,11 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length, doc_stride
 
         query_tokens = tokenizer.tokenize(example.question_text)
         if len(query_tokens) > max_query_length:
+            # 如果query的长度超出max_query_length，则截断后面的部分
             query_tokens = query_tokens[0:max_query_length]
 
-        tok_start_position = None
-        tok_end_position = None
+        tok_start_position = None    # answer在all_doc_tokens中的起始位置
+        tok_end_position = None      # answer在all_doc_tokens中的终止位置
         if is_training:
             tok_start_position = example.orig_to_tok_index[example.start_position]
             if example.end_position < len(example.doc_tokens) - 1:
@@ -576,6 +591,8 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length, doc_stride
             if start_offset + length == len(example.all_doc_tokens):
                 break
             start_offset += min(length, doc_stride)
+        
+        print ("doc_spans:", doc_spans, len(doc_spans), '\n')
 
         for (doc_span_index, doc_span) in enumerate(doc_spans):
             tokens = []

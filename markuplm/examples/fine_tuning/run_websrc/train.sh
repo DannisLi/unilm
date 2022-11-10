@@ -1,9 +1,9 @@
 CUDA_VISIBLE_DEVICES=0,1 python run.py \
-	--train_file /Path/To/WebSRC/websrc1.0_train_.json \
-	--predict_file /Path/To/WebSRC/websrc1.0_dev_.json \
-	--root_dir /Path/To/WebSRC \
+	--train_file /home/v-lizimeng/data/WebSRC/websrc1.0_train_.json \
+	--predict_file /home/v-lizimeng/data/WebSRC/websrc1.0_dev_.json \
+	--root_dir /home/v-lizimeng/data/WebSRC \
 	--model_name_or_path microsoft/markuplm-large \
-	--output_dir /Your/Output/Path \
+	--output_dir /home/v-lizimeng/unilm/markuplm/examples/fine_tuning/run_websrc/results \
 	--do_train \
 	--do_eval \
 	--eval_all_checkpoints \
