@@ -1157,9 +1157,9 @@ class MarkupLMForNodeClassification(MarkupLMPreTrainedModel):
             head_mask=None,
             inputs_embeds=None,
             num_nodes=None,
-            node_boundaries=None,
+            node_spans=None,
             node_labels=None,
-            question_boundaries=None,
+            query_span=None,
             output_attentions=None,
             output_hidden_states=None,
             return_dict=None,
@@ -1169,8 +1169,8 @@ class MarkupLMForNodeClassification(MarkupLMPreTrainedModel):
         '''
         num_nodes[bs]: the number of DOM nodes
         node_labels[bs*max_num_nodes]: the labels of DOM nodes, i.e. whether contain answers (exactly)
-        node_boundaries[bs*max_num_nodes*2]: the boundaries of DOM nodes
-        question_boundaries[bs*2]: the boundaries of questions
+        node_spans[bs*max_num_nodes*2]: the boundaries of DOM nodes
+        query_span[bs*2]: 
         '''
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
@@ -1200,9 +1200,9 @@ class MarkupLMForNodeClassification(MarkupLMPreTrainedModel):
             node_representations = []
             for b in range(batch_size):
                 num_nodes_case = num_nodes[b]
-                node_boundaries_case = node_noundaries[b]
+                node_spans_case = node_spans[b]
                 node_representations_case = torch.stack([
-                    hidden_states_layer[b, node_boundaries_case[j,0]:node_boundaries_case[j,1]].mean(dim=1) for j in range(num_nodes_case)], dim=0)
+                    hidden_states_layer[b, node_spans_case[j,0]:node_spans_case[j,1]].mean(dim=1) for j in range(num_nodes_case)], dim=0)
                 # pad [num_nodes*dim] to [max_num_nodes*dim]
                 if max_num_nodes > num_nodes_case:
                     node_representations_case = torch.cat(

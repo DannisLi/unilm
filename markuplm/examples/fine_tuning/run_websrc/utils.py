@@ -79,6 +79,8 @@ class SRCExample(object):
                  tok_to_tags_index=None,
                  xpath_tag_map=None,
                  xpath_subs_map=None,
+                 node_spans=None,
+                 answer_node=None,
                  ):
         self.doc_tokens = doc_tokens
         self.qas_id = qas_id
@@ -94,6 +96,8 @@ class SRCExample(object):
         self.tok_to_tags_index = tok_to_tags_index
         self.xpath_tag_map = xpath_tag_map
         self.xpath_subs_map = xpath_subs_map
+        self.node_spans = node_spans
+        self.answer_node = answer_node
 
     def __str__(self):
         return self.__repr__()
@@ -124,7 +128,9 @@ class SRCExample(object):
         s += f"tok_to_tags_index ({type(self.tok_to_tags_index)}): {self.tok_to_tags_index}\n"
         s += f"xpath_tag_map ({type(self.xpath_tag_map)}): {self.xpath_tag_map}\n"
         s += f"xpath_subs_map ({type(self.xpath_subs_map)}): {self.xpath_subs_map}\n"
-        s += f"tree_id_map ({type(self.tree_id_map)}): {self.tree_id_map}\n"
+        s += f"node_spans ({type(self.node_spans)}): {self.node_spans}\n"
+        s += f"answer_node ({type(self.answer_node)}): {self.answer_node}\n"
+        # s += f"tree_id_map ({type(self.tree_id_map)}): {self.tree_id_map}\n"
 
         return s
 
@@ -175,7 +181,10 @@ class InputFeatures(object):
                  token_to_tag_index=None,
                  is_impossible=None,
                  xpath_tags_seq=None,
-                 xpath_subs_seq=None
+                 xpath_subs_seq=None,
+                 node_spans=None,
+                 is_answer_node=None,
+                 query_span=None,
                  ):
         self.unique_id = unique_id
         self.example_index = example_index
@@ -194,6 +203,9 @@ class InputFeatures(object):
         self.is_impossible = is_impossible
         self.xpath_tags_seq = xpath_tags_seq
         self.xpath_subs_seq = xpath_subs_seq
+        self.node_spans = node_spans
+        self.is_answer_node = is_answer_node
+        self.query_span = query_span
 
 
 def html_escape(html):
@@ -339,42 +351,44 @@ def read_squad_examples(input_file, root_dir, is_training, tokenizer, simplify=F
         return n_char
 
     def word_tag_offset(html):
-        cnt, w_t, t_w, tags, tags_tids = 0, [], [], [], []
+        cnt, w_t = 0, []
+        w_spans = {}    # word level node spans
         for element in html.descendants:
             if type(element) == bs4.element.Tag:
                 content = ' '.join(list(element.strings)).split()
-                t_w.append({'start': cnt, 'len': len(content)})
-                tags.append('<' + element.name + '>')
-                tags_tids.append(element['tid'])
+                tid = int(element['tid'])
+                w_spans[tid] = (cnt, len(content) + cnt)
             elif type(element) == bs4.element.NavigableString and element.strip():
                 text = element.split()
-                tid = element.parent['tid']
-                ind = tags_tids.index(tid)
+                tid = int(element.parent['tid'])
                 for _ in text:
-                    w_t.append(ind)
+                    w_t.append(tid)
                     cnt += 1
                 assert cnt == len(w_t)
-        w_t.append(len(t_w))
-        w_t.append(len(t_w) + 1)
-        return w_t
+        # for additional no and yes
+        w_t.append(len(w_spans))
+        w_t.append(len(w_spans) + 1)
+        w_spans[len(w_spans)] = (cnt, cnt + 1)
+        w_spans[len(w_spans)] = (cnt + 1, cnt + 2)
+        return w_t, w_spans
 
-    def subtoken_tag_offset(html, s_tok):
-        w_t = word_tag_offset(html)
-        s_t = []
-        unique_tids = set()
+    # def subtoken_tag_offset(html, s_tok):
+    def subtoken_tag_offset(w_t, s_tok):
+        s_t = []                       # s_t: sub-token对应的tid
+        unique_tids = set()            # 总共出现的tid
         for i in range(len(s_tok)):
             s_t.append(w_t[s_tok[i]])
             unique_tids.add(w_t[s_tok[i]])
         return s_t, unique_tids
+    
 
     examples = []
-    all_tag_list = set()
+    # all_tag_list = set()
     total_num = sum([len(entry["websites"]) for entry in input_data])
     with tqdm(total=total_num, desc="Converting websites to examples") as t:
         for entry in input_data:
             domain = entry["domain"]
             for website in entry["websites"]:
-
                 # Generate Doc Tokens
                 page_id = website["page_id"]
                 curr_dir = osp.join(root_dir, domain, page_id[0:2], 'processed_data')
@@ -405,7 +419,6 @@ def read_squad_examples(input_file, root_dir, is_training, tokenizer, simplify=F
                 doc_tokens.append('yes')
                 char_to_word_offset.append(len(doc_tokens) - 1)
 
-                tag_list = []
 
                 assert len(doc_tokens) == char_to_word_offset[-1] + 1, (len(doc_tokens), char_to_word_offset[-1])
 
@@ -423,16 +436,25 @@ def read_squad_examples(input_file, root_dir, is_training, tokenizer, simplify=F
                     all_doc_tokens = []    # doc_tokens中的tokens不符合MarkupLM的词典，需要分解为符合字典的sub-tokens
                     for (i, token) in enumerate(doc_tokens):
                         orig_to_tok_index.append(len(all_doc_tokens))
-                        if token in tag_list:
-                            sub_tokens = [token]
-                        else:
-                            sub_tokens = tokenizer.tokenize(token)
+                        sub_tokens = tokenizer.tokenize(token)
                         for sub_token in sub_tokens:
                             tok_to_orig_index.append(i)
                             all_doc_tokens.append(sub_token)
+                    
+                    # convert word spans to sub token spans
+                    s_spans = {}        # sub token node spans
+                    w_t, w_spans = word_tag_offset(html_code)
+                    for tid in w_spans:
+                        try:
+                            s_spans[tid] = (orig_to_tok_index[w_spans[tid][0]], orig_to_tok_index[w_spans[tid][1]])
+                        except IndexError:
+                            s_spans[tid] = (orig_to_tok_index[w_spans[tid][0]], len(tok_to_orig_index))
+                    
+                    assert tag_num == len(w_spans), tag_num == len(s_spans)
+                    
 
                     # Generate extra information for features
-                    tok_to_tags_index, unique_tids = subtoken_tag_offset(html_code, tok_to_orig_index)    # all_doc_tokens中每个token对应的tid
+                    tok_to_tags_index, unique_tids = subtoken_tag_offset(w_t, tok_to_orig_index)    # tok_to_tags_index: all_doc_tokens中每个token对应的tid
 
                     # tid对应的tag seq和subscript seq
                     xpath_tag_map, xpath_subs_map = get_xpath_and_treeid4tokens(html_code,
@@ -440,9 +462,6 @@ def read_squad_examples(input_file, root_dir, is_training, tokenizer, simplify=F
                                                                                 max_depth=max_depth)
 
                     assert tok_to_tags_index[-1] == tag_num - 1, (tok_to_tags_index[-1], tag_num - 1)
-
-                    # build node_spans: tid: [start, end], index按照all_doc_tokens计算
-                    node_spans = {}
                     
 
                     # Process each qas, which is mainly calculate the answer position
@@ -452,6 +471,7 @@ def read_squad_examples(input_file, root_dir, is_training, tokenizer, simplify=F
                         start_position = None    # answer在doc_tokens中的起始位置
                         end_position = None      # answer在doc_tokens中的终止位置
                         orig_answer_text = None
+                        answer_node = None
 
                         if is_training:
                             if len(qa["answers"]) != 1:
@@ -460,8 +480,13 @@ def read_squad_examples(input_file, root_dir, is_training, tokenizer, simplify=F
                             answer = qa["answers"][0]
                             orig_answer_text = answer["text"]
                             if answer["element_id"] == -1:
+                                if orig_answer_text == "no":
+                                    answer_node = tag_num - 2
+                                else:
+                                    answer_node = tag_num - 1
                                 num_char = len(char_to_word_offset) - 2
                             else:
+                                answer_node = answer["element_id"]
                                 num_char = calc_num_from_raw_text_list(e_id_to_t_id(answer["element_id"], html_code),
                                                                        raw_text_list)
                             answer_offset = num_char + answer["answer_start"]
@@ -506,12 +531,14 @@ def read_squad_examples(input_file, root_dir, is_training, tokenizer, simplify=F
                             tok_to_tags_index=tok_to_tags_index,
                             xpath_tag_map=xpath_tag_map,
                             xpath_subs_map=xpath_subs_map,
+                            node_spans = s_spans,
+                            answer_node = answer_node,
                         )
 
                         examples.append(example)
 
                     t.update(1)
-    return examples, all_tag_list
+    return examples
 
 
 def convert_examples_to_features(examples, tokenizer, max_seq_length, doc_stride, max_query_length, is_training,
@@ -560,6 +587,26 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length, doc_stride
         if len(query_tokens) > max_query_length:
             # 如果query的长度超出max_query_length，则截断后面的部分
             query_tokens = query_tokens[0:max_query_length]
+        
+        # 判断输入长度是否超过最大长度
+        if len(query_tokens) + len(example.all_doc_tokens) + 3 > max_seq_length:
+            continue
+        
+        # query_span
+        query_span = [1, 1 + len(query_tokens)]
+
+        # node spans和is_answer_node
+        node_spans = []
+        is_answer_node = []
+        for tid in example.node_spans:
+            s = example.node_spans[tid]
+            node_spans.append((s[0] + 2 + len(query_tokens), s[1] + 2 + len(query_tokens)))
+            assert s[1] + 2 + len(query_tokens) < max_seq_length
+            if example.answer_node == tid:
+                is_answer_node.append(1)
+            else:
+                is_answer_node.append(0)
+        assert len(node_spans) == len(is_answer_node)
 
         tok_start_position = None    # answer在all_doc_tokens中的起始位置
         tok_end_position = None      # answer在all_doc_tokens中的终止位置
@@ -592,7 +639,6 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length, doc_stride
                 break
             start_offset += min(length, doc_stride)
         
-        # print ("doc_spans:", doc_spans, len(doc_spans), '\n')
 
         for (doc_span_index, doc_span) in enumerate(doc_spans):
             tokens = []
@@ -697,6 +743,9 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length, doc_stride
                     is_impossible=span_is_impossible,
                     xpath_tags_seq=xpath_tags_seq,
                     xpath_subs_seq=xpath_subs_seq,
+                    node_spans=node_spans,
+                    is_answer_node=is_answer_node,
+                    query_span=query_span,
                 ))
             unique_id += 1
 

@@ -19,13 +19,14 @@ from transformers import (
     get_linear_schedule_with_warmup,
 )
 
-from markuplmft.models.markuplm import MarkupLMConfig, MarkupLMTokenizer, MarkupLMTokenizerFast, MarkupLMForQuestionAnswering
+from markuplmft.models.markuplm import MarkupLMConfig, MarkupLMTokenizer, MarkupLMTokenizerFast, MarkupLMForNodeClassification
 
 from utils import StrucDataset
 from utils import (read_squad_examples, convert_examples_to_features, RawResult, write_predictions)
 from utils_evaluate import EvalOpts, main as evaluate_on_squad
 
 from matplotlib import pyplot as plt
+
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +126,8 @@ def train(args, train_dataset, model, tokenizer):
                       'xpath_subs_seq': batch[4],
                       'start_positions': batch[5],
                       'end_positions': batch[6],
+                      'node_spans': batch[7],
+                      'node_labels': batch[8],
                       }
 
             outputs = model(**inputs)
@@ -270,7 +273,7 @@ def load_and_cache_examples(args, tokenizer, max_depth=50, evaluate=False, outpu
     # Load data features from cache or dataset file
     input_file = args.predict_file if evaluate else args.train_file
 
-    cached_features_file = os.path.join(os.path.dirname(input_file), 'cached', 'cached_{}_{}_{}_{}'.format(
+    cached_features_file = os.path.join(os.path.dirname(input_file), 'cached_cls', 'cached_{}_{}_{}_{}'.format(
         'dev' if evaluate else 'train',
         "markuplm",
         str(args.max_seq_length),
@@ -300,28 +303,6 @@ def load_and_cache_examples(args, tokenizer, max_depth=50, evaluate=False, outpu
                                        tokenizer=tokenizer,
                                        simplify=False,
                                        max_depth=max_depth)
-        
-        # hist: number of tokens
-        # logger.info("Drawing the histogram for number of tokens")
-        # page_len_list = sorted([len(e.all_doc_tokens) for e in examples], reverse=True)
-        # plt.hist(page_len_list[int(0.1*len(page_len_list)):], bins=30)
-        # plt.savefig('page_len.png')
-        # plt.close()
-        # c1, c2 = 0, 0
-        # for x in page_len_list:
-        #     if x <= 467:
-        #         c1 += 1
-        #         c2 += 1
-        #     elif x <=508:
-        #         c2 += 1
-        # print (c1, c2, len(page_len_list), c1 / len(page_len_list), c2 / len(page_len_list))
-
-        # hist: number of nodes
-        # logger.info("Drawing the histogram for number of nodes")
-        # num_node_spans_list = sorted([len(e.node_spans) for e in examples], reverse=True)
-        # plt.hist(num_node_spans_list[int(0.05*len(num_node_spans_list)):], bins=30)
-        # plt.savefig('num_node_spans.png')
-        # plt.close()
 
 
         features = convert_examples_to_features(examples=examples,
@@ -358,11 +339,41 @@ def load_and_cache_examples(args, tokenizer, max_depth=50, evaluate=False, outpu
         dataset = StrucDataset(all_input_ids, all_input_mask, all_segment_ids, all_feature_index,
                                all_xpath_tags_seq, all_xpath_subs_seq, )
     else:
+        # 训练模式，每个case选择一个正例和随机k-1个负例
+        all_node_spans = []
+        all_is_answer_node = []
+        for node_spans, is_answer_node in zip(features.node_spans, features.is_answer_node):
+            node_num = len(node_spans)
+            _node_spans = []
+            _is_answer_node = []
+            # 找出正样本
+            for span, label in zip(node_spans, is_answer_node):
+                if label == 1:
+                    _node_spans.append(span)
+                    _is_answer_node.append(1)
+                    break
+            # 随机负样本
+            if node_num < args.num_node_spans_per_case-1:
+                selected_indexes = np.random.choice(node_num * int(np.ceil(args.num_node_spans_per_case / tag_num)), args.num_node_spans_per_case-1, replace=False)
+                selected_indexes = [i % node_num for i in selected_indexes]
+            else:
+                selected_indexes = np.random.choice(node_num, args.num_node_spans_per_case-1, replace=False)
+            for i in selected_indexes:
+                _node_spans.append(node_spans[i])
+                _is_answer_node.append(is_answer_node[i])
+            # 
+            all_node_spans.append(_node_spans)
+            all_is_answer_node.append(_is_answer_node)
+        all_node_spans = torch.tensor(all_node_spans, dtype=torch.long)
+        all_is_answer_node = torch.tensor(all_is_answer_node, dtype=torch.long)
+        all_num_nodes = torch.tensor([args.num_node_spans_per_case for _ in all_input_ids.view(0)], dtype=torch.long)
+        # 
         all_start_positions = torch.tensor([f.start_position for f in features], dtype=torch.long)
         all_end_positions = torch.tensor([f.end_position for f in features], dtype=torch.long)
         dataset = StrucDataset(all_input_ids, all_input_mask, all_segment_ids,
                                all_xpath_tags_seq, all_xpath_subs_seq,
-                               all_start_positions, all_end_positions, )
+                               all_start_positions, all_end_positions,
+                               all_node_spans, all_is_answer_node, all_ )
 
     if output_examples:
         dataset = (dataset, examples, features)
@@ -475,6 +486,7 @@ def main():
                              "See details at https://nvidia.github.io/apex/amp.html")
     parser.add_argument('--server_ip', type=str, default='', help="Can be used for distant debugging.")
     parser.add_argument('--server_port', type=str, default='', help="Can be used for distant debugging.")
+    parser.add_argument('--num_node_spans_per_case', type=int, default=16, help="The number of node spans per case during training.")
     args = parser.parse_args()
 
     if os.path.exists(args.output_dir) and os.listdir(
@@ -514,7 +526,8 @@ def main():
     logger.info(str(config))
     max_depth = config.max_depth
     tokenizer = MarkupLMTokenizer.from_pretrained(args.model_name_or_path)
-    model = MarkupLMForQuestionAnswering.from_pretrained(args.model_name_or_path, config=config)
+    # model = MarkupLMForQuestionAnswering.from_pretrained(args.model_name_or_path, config=config)
+    model = MarkupLMForNodeClassification.from_pretrained(args.model_name_or_path, config=config)
 
     if args.local_rank == 0:
         torch.distributed.barrier()
@@ -582,7 +595,8 @@ def main():
                 continue
             if global_step and args.eval_to_checkpoint is not None and int(global_step) >= args.eval_to_checkpoint:
                 continue
-            model = MarkupLMForQuestionAnswering.from_pretrained(checkpoint, config=config)
+            # model = MarkupLMForQuestionAnswering.from_pretrained(checkpoint, config=config)
+            model = MarkupLMForNodeClassification.from_pretrained(checkpoint, config=config)
             model.to(args.device)
 
             # Evaluate
