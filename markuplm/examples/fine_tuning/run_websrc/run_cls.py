@@ -303,6 +303,28 @@ def load_and_cache_examples(args, tokenizer, max_depth=50, evaluate=False, outpu
                                        tokenizer=tokenizer,
                                        simplify=False,
                                        max_depth=max_depth)
+        
+        # hist: number of tokens
+        # logger.info("Drawing the histogram for number of tokens")
+        # page_len_list = sorted([len(e.all_doc_tokens) for e in examples], reverse=True)
+        # plt.hist(page_len_list[int(0.1*len(page_len_list)):], bins=30)
+        # plt.savefig('page_len.png')
+        # plt.close()
+        # c1, c2 = 0, 0
+        # for x in page_len_list:
+        #     if x <= 467:
+        #         c1 += 1
+        #         c2 += 1
+        #     elif x <=508:
+        #         c2 += 1
+        # print (c1, c2, len(page_len_list), c1 / len(page_len_list), c2 / len(page_len_list))
+
+        # hist: number of nodes
+        # logger.info("Drawing the histogram for number of nodes")
+        # num_node_spans_list = sorted([len(e.node_spans) for e in examples], reverse=True)
+        # plt.hist(num_node_spans_list[int(0.05*len(num_node_spans_list)):], bins=30)
+        # plt.savefig('num_node_spans.png')
+        # plt.close()
 
 
         features = convert_examples_to_features(examples=examples,
@@ -486,7 +508,7 @@ def main():
                              "See details at https://nvidia.github.io/apex/amp.html")
     parser.add_argument('--server_ip', type=str, default='', help="Can be used for distant debugging.")
     parser.add_argument('--server_port', type=str, default='', help="Can be used for distant debugging.")
-    parser.add_argument('--num_node_spans_per_case', type=int, default=16, help="The number of node spans per case during training.")
+    parser.add_argument('--num_node_spans_per_page', type=int, default=16, help="The number of node spans per case during training.")
     args = parser.parse_args()
 
     if os.path.exists(args.output_dir) and os.listdir(

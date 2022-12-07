@@ -5,6 +5,7 @@ import os.path as osp
 import os
 from operator import itemgetter
 
+# python dataset_generation.py --root_dir /home/v-lizimeng/data/WebSRC --version websrc1.0
 
 def parse_args():
     parser = argparse.ArgumentParser()

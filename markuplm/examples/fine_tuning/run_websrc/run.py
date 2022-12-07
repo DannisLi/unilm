@@ -25,7 +25,7 @@ from utils import StrucDataset
 from utils import (read_squad_examples, convert_examples_to_features, RawResult, write_predictions)
 from utils_evaluate import EvalOpts, main as evaluate_on_squad
 
-from matplotlib import pyplot as plt
+# from matplotlib import pyplot as plt
 
 logger = logging.getLogger(__name__)
 
@@ -300,28 +300,6 @@ def load_and_cache_examples(args, tokenizer, max_depth=50, evaluate=False, outpu
                                        tokenizer=tokenizer,
                                        simplify=False,
                                        max_depth=max_depth)
-        
-        # hist: number of tokens
-        # logger.info("Drawing the histogram for number of tokens")
-        # page_len_list = sorted([len(e.all_doc_tokens) for e in examples], reverse=True)
-        # plt.hist(page_len_list[int(0.1*len(page_len_list)):], bins=30)
-        # plt.savefig('page_len.png')
-        # plt.close()
-        # c1, c2 = 0, 0
-        # for x in page_len_list:
-        #     if x <= 467:
-        #         c1 += 1
-        #         c2 += 1
-        #     elif x <=508:
-        #         c2 += 1
-        # print (c1, c2, len(page_len_list), c1 / len(page_len_list), c2 / len(page_len_list))
-
-        # hist: number of nodes
-        # logger.info("Drawing the histogram for number of nodes")
-        # num_node_spans_list = sorted([len(e.node_spans) for e in examples], reverse=True)
-        # plt.hist(num_node_spans_list[int(0.05*len(num_node_spans_list)):], bins=30)
-        # plt.savefig('num_node_spans.png')
-        # plt.close()
 
 
         features = convert_examples_to_features(examples=examples,

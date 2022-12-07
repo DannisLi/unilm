@@ -1208,7 +1208,6 @@ class MarkupLMForNodeClassification(MarkupLMPreTrainedModel):
             for h in hidden_states:
                 # num_nodes * dim
                 tmp = torch.stack([h[node_spans_case[i][0]:node_spans_case[i][1]].mean(dim=0) for i in range(num_nodes_case)], dim=0)
-                # node_reps_case.append(torch.stack([h[sp[0]:sp[1]].mean(dim=0) for sp in node_spans_case], dim=0))
                 # pad: max_num_nodes * dim
                 tmp = torch.cat((tmp, torch.zeros(max_num_nodes-num_nodes_case, self.hidden_size)), dim=0)
                 node_reps_case.append(tmp)
@@ -1232,37 +1231,9 @@ class MarkupLMForNodeClassification(MarkupLMPreTrainedModel):
             # loss for layer
             loss.append(self.loss_fct(tmp.view(-1, self.num_labels), node_labels.view(-1, 1)))
         
-        # for lno, hidden_states_layer in enumerate(hidden_states):
-        #     # 计算query embedding: [bs*dim]
-        #     query_rep = hidden_states_layer[:,]
-        #     # hidden_states_layer: [bs*max_seq_len*dim]
-        #     # 计算节点表征(avg pooling)
-        #     node_representations = []
-        #     for b in range(batch_size):
-        #         num_nodes_case = num_nodes[b]
-        #         node_spans_case = node_spans[b]
-        #         node_representations_case = torch.stack([
-        #             hidden_states_layer[b, node_spans_case[j,0]:node_spans_case[j,1]].mean(dim=1) for j in range(num_nodes_case)], dim=0)
-        #         # pad [num_nodes*dim] to [max_num_nodes*dim]
-        #         if max_num_nodes > num_nodes_case:
-        #             node_representations_case = torch.cat(
-        #                 (node_representations_case, torch.zeros(max_num_nodes-num_nodes_case, self.hidden_size)), dim=0)
-        #         # put into
-        #         node_representations.append(node_representations_case)
-        #     # stack list to tensor [bs*max_num_nodes*dim]
-        #     node_representations = torch.stack(node_representations)
-            
-        #     # 计算节点分类(MLP classifier)
-        #     logits_layer = self.classifiers[lno](node_representations)    # [bs*max_num_nodes*num_labels]
-
-        #     # 计算分类损失(CE Loss)
-        #     loss_layer = self.loss_fct(logits_layer.view(-1, self.num_labels), node_labels.view(-1, 1))
-
-        #     logits.append(logits_layer)
-        #     loss.append(loss_layer)
 
         logits = torch.stack(logits, dim=1)                # [bs*layers*max_num_nodes*num_labels]
-        loss = torch.stack(loss, dim=0)unsqueeze(0)        # [1 * layers]
+        loss = torch.stack(loss, dim=0).unsqueeze(0)        # [1 * layers]
 
         return logits, loss
 
