@@ -600,6 +600,8 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length, doc_stride
         is_answer_node = []
         for tid in example.node_spans:
             s = example.node_spans[tid]
+            if s[0] >= s[1]:
+                continue
             node_spans.append((s[0] + 2 + len(query_tokens), s[1] + 2 + len(query_tokens)))
             assert s[1] + 2 + len(query_tokens) < max_seq_length
             if example.answer_node == tid:

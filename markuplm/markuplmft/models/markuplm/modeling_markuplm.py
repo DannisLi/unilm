@@ -1132,6 +1132,8 @@ class MarkupLMForNodeClassification(MarkupLMPreTrainedModel):
         self.hidden_size = config.hidden_size
         self.num_labels = config.num_labels
 
+        # print (self.num_labels)
+
         self.markuplm = MarkupLMModel(config, add_pooling_layer=False)
         self.classifiers = nn.ModuleList([self.build_classifier() for _ in range(config.num_hidden_layers+1)])
         self.loss_fct = CrossEntropyLoss()
@@ -1141,8 +1143,10 @@ class MarkupLMForNodeClassification(MarkupLMPreTrainedModel):
     def build_classifier(self):
         return nn.Sequential(
             nn.Linear(self.hidden_size*2, self.hidden_size),
+            nn.Dropout(),
             nn.GELU(),
             nn.Linear(self.hidden_size, self.hidden_size),
+            nn.Dropout(),
             nn.GELU(),
             nn.Linear(self.hidden_size, self.num_labels),
         )
@@ -1172,6 +1176,8 @@ class MarkupLMForNodeClassification(MarkupLMPreTrainedModel):
         node_spans[bs*max_num_nodes*2]: the boundaries of DOM nodes
         query_span[bs*2]: 
         '''
+        # print ("input_ids:", input_ids.shape, "node_spans:", node_spans.shape, "node_labels:", node_labels.shape, "query_span:", query_span.shape)
+
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         outputs = self.markuplm(
@@ -1188,50 +1194,51 @@ class MarkupLMForNodeClassification(MarkupLMPreTrainedModel):
             return_dict=return_dict,
         )
 
-        hidden_states = outputs.hidden_states
+        # [batch_size * num_layer * seq_len * dim]
+        hidden_states = torch.stack(outputs.hidden_states, dim=0).transpose(0, 1)
+        # hidden_states = outputs.hidden_states
         max_num_nodes = node_labels.shape[1]
         batch_size = node_labels.shape[0]
+
 
         logits, loss = [], []
 
         query_rep = []
         node_reps = []
         for b in range(batch_size):
+            hidden_states[b]
             # 当前case的query embeddings: [num_layers * dim]
-            query_rep_case = torch.stack([h[query_span[b,0]:query_span[b,1]].mean(dim=0) for h in hidden_states], dim=0)
+            query_rep_case = hidden_states[b, :, query_span[b,0]:query_span[b,1]].mean(dim=1)
+            # torch.stack([h[b, query_span[b,0]:query_span[b,1]].mean(dim=0) for h in hidden_states], dim=0)
             query_rep.append(query_rep_case)
             # 当前case的节点数和spans
-            # num_nodes_case = num_nodes[b]
             node_spans_case = node_spans[b]    # [max_num_nodes * 2]
             # 当前case的所有nodes的embedings: [num_layers * max_num_nodes * dim]
-            node_reps_case = []
-            for h in hidden_states:
-                # num_nodes * dim
-                # tmp = torch.stack([h[node_spans_case[i][0]:node_spans_case[i][1]].mean(dim=0) for i in range(num_nodes_case)], dim=0)
-                # max_num_nodes * dim
-                tmp = torch.stack([h[sp[0]:sp[1]].mean(dim=0) for sp in node_spans_case], dim=0)
-                # pad: max_num_nodes * dim
-                # tmp = torch.cat((tmp, torch.zeros(max_num_nodes-num_nodes_case, self.hidden_size)), dim=0)
-                node_reps_case.append(tmp)
-
+            node_reps_case = torch.stack([hidden_states[b, :, sp[0]:sp[1]].mean(dim=1) for sp in node_spans_case], dim=1)
+            # node_reps_case = []
+            # for h in hidden_states:
+            #     # max_num_nodes * dim
+            #     tmp = torch.stack([h[b, sp[0]:sp[1]].mean(dim=0) for sp in node_spans_case], dim=0)
+            #     node_reps_case.append(tmp)
+            # node_reps_case = torch.stack(node_reps_case, dim=0)
             node_reps.append(node_reps_case)
         
         # query_rep: [batch_size * num_layers * dim] & node_reps: [batch_size * num_layers * max_num_nodes * dim]
         query_rep = torch.stack(query_rep, dim=0)
         node_reps = torch.stack(node_reps, dim=0)
 
+        # print ("query_rep:", query_rep.shape, "node_reps:", node_reps.shape)
         # cat query and node reps
         cls_inputs = torch.cat((query_rep.unsqueeze(2).repeat(1,1,max_num_nodes,1), node_reps), dim=3)
 
-
         logits, loss = [], []
         # 计算logits和loss
-        for i in range(config.num_hidden_layers+1):
+        for i in range(self.config.num_hidden_layers+1):
             # logits for layer: [batch_size, max_num_nodes, num_labels]
-            tmp = self.classifiers[i](cls_inputs[:,i])
-            logits.append(tmp)
+            preds = self.classifiers[i](cls_inputs[:,i])
+            logits.append(preds)
             # loss for layer
-            loss.append(self.loss_fct(tmp.view(-1, self.num_labels), node_labels.view(-1, 1)))
+            loss.append(self.loss_fct(preds.view(-1, self.num_labels), node_labels.view(-1)))
         
 
         logits = torch.stack(logits, dim=1)                # [bs*layers*max_num_nodes*num_labels]

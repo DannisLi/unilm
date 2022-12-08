@@ -105,3 +105,4 @@ venv.bak/
 
 runs
 results_cls
+*.out

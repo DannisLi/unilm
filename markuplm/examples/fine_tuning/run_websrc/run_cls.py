@@ -1,5 +1,6 @@
 from __future__ import absolute_import, division, print_function
 
+import sys
 import argparse
 import logging
 import os
@@ -115,8 +116,9 @@ def train(args, train_dataset, model, tokenizer):
     for epoch in train_iterator:
         if isinstance(train_dataloader, DataLoader) and isinstance(train_dataloader.sampler, DistributedSampler):
             train_dataloader.sampler.set_epoch(epoch)
-        epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
-        for step, batch in enumerate(epoch_iterator):
+        # epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
+        # for step, batch in enumerate(epoch_iterator):
+        for step, batch in enumerate(train_dataloader):
             model.train()
             batch = tuple(t.to(args.device) for t in batch)
             inputs = {'input_ids': batch[0],
@@ -130,10 +132,15 @@ def train(args, train_dataset, model, tokenizer):
                       }
 
             outputs = model(**inputs)
-            loss = outputs[0]  # model outputs are always tuple in transformers (see doc)
+            loss_per_layer = outputs[1].mean(dim=0)    # [gpus * num_layers] -> [num_layers]
+            loss = loss_per_layer.mean()
 
-            if args.n_gpu > 1:
-                loss = loss.mean()  # mean() to average on multi-gpu parallel (not distributed) training
+            if step % 10 == 0:
+                print ("epoch:", epoch, "step:", step, "loss:", loss_per_layer.detach().cpu().numpy())
+                sys.stdout.flush()
+
+            # if args.n_gpu > 1:
+            #     loss = loss.mean()  # mean() to average on multi-gpu parallel (not distributed) training
             if args.gradient_accumulation_steps > 1:
                 loss = loss / args.gradient_accumulation_steps
 
@@ -175,10 +182,13 @@ def train(args, train_dataset, model, tokenizer):
                     model_to_save.save_pretrained(output_dir)
                     torch.save(args, os.path.join(output_dir, 'training_args.bin'))
                     logger.info("Saving model checkpoint to %s", output_dir)
-
+            
+            del batch, inputs, outputs, loss_per_layer, loss
+            
             if 0 < args.max_steps < global_step:
-                epoch_iterator.close()
+                # epoch_iterator.close()
                 break
+
         if 0 < args.max_steps < global_step:
             train_iterator.close()
             break
@@ -556,11 +566,11 @@ def main():
         # Make sure only the first process in distributed training will download model & vocab
 
     config = MarkupLMConfig.from_pretrained(args.model_name_or_path)
+    config.num_labels = 2
     logger.info("=====Config for model=====")
     logger.info(str(config))
     max_depth = config.max_depth
     tokenizer = MarkupLMTokenizer.from_pretrained(args.model_name_or_path)
-    # model = MarkupLMForQuestionAnswering.from_pretrained(args.model_name_or_path, config=config)
     model = MarkupLMForNodeClassification.from_pretrained(args.model_name_or_path, config=config)
 
     if args.local_rank == 0:
