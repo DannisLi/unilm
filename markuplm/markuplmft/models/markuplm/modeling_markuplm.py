@@ -1156,7 +1156,7 @@ class MarkupLMForNodeClassification(MarkupLMPreTrainedModel):
             position_ids=None,
             head_mask=None,
             inputs_embeds=None,
-            num_nodes=None,
+            # num_nodes=None,
             node_spans=None,
             node_labels=None,
             query_span=None,
@@ -1201,15 +1201,17 @@ class MarkupLMForNodeClassification(MarkupLMPreTrainedModel):
             query_rep_case = torch.stack([h[query_span[b,0]:query_span[b,1]].mean(dim=0) for h in hidden_states], dim=0)
             query_rep.append(query_rep_case)
             # 当前case的节点数和spans
-            num_nodes_case = num_nodes[b]
+            # num_nodes_case = num_nodes[b]
             node_spans_case = node_spans[b]    # [max_num_nodes * 2]
             # 当前case的所有nodes的embedings: [num_layers * max_num_nodes * dim]
             node_reps_case = []
             for h in hidden_states:
                 # num_nodes * dim
-                tmp = torch.stack([h[node_spans_case[i][0]:node_spans_case[i][1]].mean(dim=0) for i in range(num_nodes_case)], dim=0)
+                # tmp = torch.stack([h[node_spans_case[i][0]:node_spans_case[i][1]].mean(dim=0) for i in range(num_nodes_case)], dim=0)
+                # max_num_nodes * dim
+                tmp = torch.stack([h[sp[0]:sp[1]].mean(dim=0) for sp in node_spans_case], dim=0)
                 # pad: max_num_nodes * dim
-                tmp = torch.cat((tmp, torch.zeros(max_num_nodes-num_nodes_case, self.hidden_size)), dim=0)
+                # tmp = torch.cat((tmp, torch.zeros(max_num_nodes-num_nodes_case, self.hidden_size)), dim=0)
                 node_reps_case.append(tmp)
 
             node_reps.append(node_reps_case)

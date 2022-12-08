@@ -25,7 +25,7 @@ from utils import StrucDataset
 from utils import (read_squad_examples, convert_examples_to_features, RawResult, write_predictions)
 from utils_evaluate import EvalOpts, main as evaluate_on_squad
 
-from matplotlib import pyplot as plt
+# from matplotlib import pyplot as plt
 
 
 logger = logging.getLogger(__name__)
@@ -124,10 +124,9 @@ def train(args, train_dataset, model, tokenizer):
                       'token_type_ids': batch[2],
                       'xpath_tags_seq': batch[3],
                       'xpath_subs_seq': batch[4],
-                      'start_positions': batch[5],
-                      'end_positions': batch[6],
-                      'node_spans': batch[7],
-                      'node_labels': batch[8],
+                      'node_spans': batch[5],
+                      'node_labels': batch[6],
+                      'query_span': batch[7],
                       }
 
             outputs = model(**inputs)
@@ -194,7 +193,9 @@ def evaluate(args, model, tokenizer, max_depth, prefix=""):
     r"""
     Evaluate the model
     """
-    dataset, examples, features = load_and_cache_examples(args, tokenizer, max_depth=max_depth, evaluate=True,
+    # dataset, examples, features = load_and_cache_examples(args, tokenizer, max_depth=max_depth, evaluate=True,
+    #                                                       output_examples=True)
+    features = load_and_cache_examples(args, tokenizer, max_depth=max_depth, evaluate=True,
                                                           output_examples=True)
 
     if not os.path.exists(args.output_dir) and args.local_rank in [-1, 0]:
@@ -353,6 +354,8 @@ def load_and_cache_examples(args, tokenizer, max_depth=50, evaluate=False, outpu
     all_input_mask = torch.tensor([f.input_mask for f in features], dtype=torch.long)
     all_segment_ids = torch.tensor([f.segment_ids for f in features], dtype=torch.long)
 
+    # print (all_input_ids.shape, all_input_mask.shape, all_segment_ids.shape)
+
     all_xpath_tags_seq = torch.tensor([f.xpath_tags_seq for f in features], dtype=torch.long)
     all_xpath_subs_seq = torch.tensor([f.xpath_subs_seq for f in features], dtype=torch.long)
 
@@ -364,7 +367,11 @@ def load_and_cache_examples(args, tokenizer, max_depth=50, evaluate=False, outpu
         # 训练模式，每个case选择一个正例和随机k-1个负例
         all_node_spans = []
         all_is_answer_node = []
-        for node_spans, is_answer_node in zip(features.node_spans, features.is_answer_node):
+        all_query_span = []
+        for f in features:
+            # 
+            node_spans, is_answer_node = f.node_spans, f.is_answer_node 
+            # 
             node_num = len(node_spans)
             _node_spans = []
             _is_answer_node = []
@@ -374,31 +381,36 @@ def load_and_cache_examples(args, tokenizer, max_depth=50, evaluate=False, outpu
                     _node_spans.append(span)
                     _is_answer_node.append(1)
                     break
+            # 已经有一个node了
+            cnt = 1
             # 随机负样本
-            if node_num < args.num_node_spans_per_case-1:
-                selected_indexes = np.random.choice(node_num * int(np.ceil(args.num_node_spans_per_case / tag_num)), args.num_node_spans_per_case-1, replace=False)
-                selected_indexes = [i % node_num for i in selected_indexes]
-            else:
-                selected_indexes = np.random.choice(node_num, args.num_node_spans_per_case-1, replace=False)
-            for i in selected_indexes:
+            while cnt + node_num <= args.num_node_spans_per_case:
+                _node_spans.extend(node_spans)
+                _is_answer_node.extend(is_answer_node)
+                cnt += node_num
+            selected_indices = np.random.choice(node_num, args.num_node_spans_per_case-cnt, replace=False)
+            for i in selected_indices:
                 _node_spans.append(node_spans[i])
                 _is_answer_node.append(is_answer_node[i])
-            # 
+            # 添加到全体
             all_node_spans.append(_node_spans)
             all_is_answer_node.append(_is_answer_node)
+            all_query_span.append(f.query_span)
+        
+        all_query_span = torch.tensor(all_query_span, dtype=torch.long)
         all_node_spans = torch.tensor(all_node_spans, dtype=torch.long)
         all_is_answer_node = torch.tensor(all_is_answer_node, dtype=torch.long)
-        all_num_nodes = torch.tensor([args.num_node_spans_per_case for _ in all_input_ids.view(0)], dtype=torch.long)
+        # all_num_nodes = torch.tensor([args.num_node_spans_per_case for _ in range(all_input_ids.size(0))], dtype=torch.long)
         # 
-        all_start_positions = torch.tensor([f.start_position for f in features], dtype=torch.long)
-        all_end_positions = torch.tensor([f.end_position for f in features], dtype=torch.long)
+        # all_start_positions = torch.tensor([f.start_position for f in features], dtype=torch.long)
+        # all_end_positions = torch.tensor([f.end_position for f in features], dtype=torch.long)
         dataset = StrucDataset(all_input_ids, all_input_mask, all_segment_ids,
                                all_xpath_tags_seq, all_xpath_subs_seq,
-                               all_start_positions, all_end_positions,
-                               all_node_spans, all_is_answer_node, all_ )
+                               all_node_spans, all_is_answer_node, all_query_span)
 
     if output_examples:
         dataset = (dataset, examples, features)
+    
     return dataset
 
 
@@ -508,7 +520,7 @@ def main():
                              "See details at https://nvidia.github.io/apex/amp.html")
     parser.add_argument('--server_ip', type=str, default='', help="Can be used for distant debugging.")
     parser.add_argument('--server_port', type=str, default='', help="Can be used for distant debugging.")
-    parser.add_argument('--num_node_spans_per_page', type=int, default=16, help="The number of node spans per case during training.")
+    parser.add_argument('--num_node_spans_per_case', type=int, default=16, help="The number of node spans per case during training.")
     args = parser.parse_args()
 
     if os.path.exists(args.output_dir) and os.listdir(
@@ -617,7 +629,6 @@ def main():
                 continue
             if global_step and args.eval_to_checkpoint is not None and int(global_step) >= args.eval_to_checkpoint:
                 continue
-            # model = MarkupLMForQuestionAnswering.from_pretrained(checkpoint, config=config)
             model = MarkupLMForNodeClassification.from_pretrained(checkpoint, config=config)
             model.to(args.device)
 

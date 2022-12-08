@@ -10,6 +10,6 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python run_cls.py \
 	--max_seq_length 512 \
 	--per_gpu_train_batch_size 4 \
 	--per_gpu_eval_batch_size 8 \
-	--num_node_spans_per_case 16 \
+	--num_node_spans_per_case 256 \
 	--warmup_ratio 0.1 \
 	--num_train_epochs 5

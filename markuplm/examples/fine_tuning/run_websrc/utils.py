@@ -588,7 +588,7 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length, doc_stride
             # 如果query的长度超出max_query_length，则截断后面的部分
             query_tokens = query_tokens[0:max_query_length]
         
-        # 判断输入长度是否超过最大长度
+        # 不超过模型的最大输入长度，保证一个query-page pair一次性输入
         if len(query_tokens) + len(example.all_doc_tokens) + 3 > max_seq_length:
             continue
         
