@@ -136,7 +136,8 @@ def train(args, train_dataset, model, tokenizer):
             loss = loss_per_layer.mean()
 
             if step % 10 == 0:
-                print ("epoch:", epoch, "step:", step, "loss:", loss_per_layer.detach().cpu().numpy())
+                print ("epoch:", epoch, "step:", step, "loss per layer:", loss_per_layer.detach().cpu().numpy(), "total loss:", round(loss.item(), 6))
+                print ()
                 sys.stdout.flush()
 
             # if args.n_gpu > 1:
@@ -199,22 +200,22 @@ def train(args, train_dataset, model, tokenizer):
     return global_step, tr_loss / global_step
 
 
-def evaluate(args, model, tokenizer, max_depth, prefix=""):
+def evaluate(args, eval_dataset, model, tokenizer, max_depth, prefix=""):
     r"""
     Evaluate the model
     """
     # dataset, examples, features = load_and_cache_examples(args, tokenizer, max_depth=max_depth, evaluate=True,
     #                                                       output_examples=True)
-    features = load_and_cache_examples(args, tokenizer, max_depth=max_depth, evaluate=True,
-                                                          output_examples=True)
+    # eval_dataset = load_and_cache_examples(args, tokenizer, max_depth=max_depth, evaluate=True,
+    #                                                       output_examples=False)
 
     if not os.path.exists(args.output_dir) and args.local_rank in [-1, 0]:
         os.makedirs(args.output_dir)
 
     args.eval_batch_size = args.per_gpu_eval_batch_size * max(1, args.n_gpu)
     # Note that DistributedSampler samples randomly
-    eval_sampler = SequentialSampler(dataset) if args.local_rank == -1 else DistributedSampler(dataset)
-    eval_dataloader = DataLoader(dataset, sampler=eval_sampler, batch_size=args.eval_batch_size
+    eval_sampler = SequentialSampler(eval_dataset) if args.local_rank == -1 else DistributedSampler(eval_dataset)
+    eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size
                                  , num_workers=args.dataloader_workers)
 
     # multi-gpu evaluate
@@ -223,54 +224,51 @@ def evaluate(args, model, tokenizer, max_depth, prefix=""):
 
     # Eval!
     logger.info("***** Running evaluation {} *****".format(prefix))
-    logger.info("  Num examples = %d", len(dataset))
+    logger.info("  Num examples = %d", len(eval_dataset))
     logger.info("  Batch size = %d", args.eval_batch_size)
     all_results = []
-    start_time = timeit.default_timer()
-    for batch in tqdm(eval_dataloader, desc="Evaluating"):
+    # start_time = timeit.default_timer()
+    # list of list: cases * layers
+    page_percision = []
+    page_recall = []
+    # for batch in tqdm(eval_dataloader, desc="Evaluating"):
+    for batch in eval_dataloader:
         model.eval()
         batch = tuple(t.to(args.device) for t in batch)
         with torch.no_grad():
             inputs = {'input_ids': batch[0],
                       'attention_mask': batch[1],
                       'token_type_ids': batch[2],
-                      'xpath_tags_seq': batch[4],
-                      'xpath_subs_seq': batch[5],
+                      'xpath_tags_seq': batch[3],
+                      'xpath_subs_seq': batch[4],
+                      'node_spans': batch[5],
+                      'node_labels': batch[6],
+                      'query_span': batch[7],
                       }
-            feature_indices = batch[3]
+
             outputs = model(**inputs)
+            logits = outputs[0]    # [bs*layers*max_num_nodes*num_labels]
+            # logit[i] > 0 -> pred = i: [bs*layers*max_num_nodes]
+            # preds: [bs*layers*max_num_nodes], 
+            preds = (logits[:,:,:,1] > 0).long().detach().cpu().numpy()
+            labels = batch[6].cpu().numpy()    # [bs * max_num_nodes]
 
-        for i, feature_index in enumerate(feature_indices):
-            eval_feature = features[feature_index.item()]
-            unique_id = int(eval_feature.unique_id)
-            result = RawResult(unique_id=unique_id,
-                               start_logits=to_list(outputs[0][i]),
-                               end_logits=to_list(outputs[1][i]))
-            all_results.append(result)
+        # 计算每个page上的percision & recall
+        for page_preds, page_labels in zip(preds, labels):
+            # page_preds: [layers * nodes]
+            # page_labels: [nodes]
+            tmp = (page_preds * page_labels).sum(1)
+            # page_percision.append(tmp / page_preds.sum(1))
+            page_recall.append(tmp / page_labels.sum())
+        
+        # 
+        del batch, inputs, outputs, logits
+        
+    # page_percision = np.array(page_percision)
+    page_recall = np.array(page_recall)
+    # print ("Percision:", page_percision.mean(0))
+    print ("Recall:", page_recall.mean(0))
 
-    eval_time = timeit.default_timer() - start_time
-    logger.info("  Evaluation done in total %f secs (%f sec per example)", eval_time, eval_time / len(dataset))
-
-    # Compute predictions
-    output_prediction_file = os.path.join(args.output_dir, "predictions_{}.json".format(prefix))
-    output_tag_prediction_file = os.path.join(args.output_dir, "tag_predictions_{}.json".format(prefix))
-    output_nbest_file = os.path.join(args.output_dir, "nbest_predictions_{}.json".format(prefix))
-    output_result_file = os.path.join(args.output_dir, "qas_eval_results_{}.json".format(prefix))
-    output_file = os.path.join(args.output_dir, "eval_matrix_results_{}".format(prefix))
-
-    write_predictions(examples, features, all_results, args.n_best_size, args.max_answer_length, args.do_lower_case,
-                      output_prediction_file, output_tag_prediction_file, output_nbest_file, args.verbose_logging,
-                      tokenizer)
-
-    # Evaluate
-    evaluate_options = EvalOpts(data_file=args.predict_file,
-                                root_dir=args.root_dir,
-                                pred_file=output_prediction_file,
-                                tag_pred_file=output_tag_prediction_file,
-                                result_file=output_result_file,
-                                out_file=output_file)
-    results = evaluate_on_squad(evaluate_options)
-    return results
 
 
 def load_and_cache_examples(args, tokenizer, max_depth=50, evaluate=False, output_examples=False):
@@ -299,7 +297,8 @@ def load_and_cache_examples(args, tokenizer, max_depth=50, evaluate=False, outpu
         if output_examples:
             examples = read_squad_examples(input_file=input_file,
                                            root_dir=args.root_dir,
-                                           is_training=not evaluate,
+                                           # is_training=not evaluate,
+                                           is_training=True,
                                            tokenizer=tokenizer,
                                            simplify=True,
                                            max_depth=max_depth)
@@ -310,7 +309,8 @@ def load_and_cache_examples(args, tokenizer, max_depth=50, evaluate=False, outpu
 
         examples = read_squad_examples(input_file=input_file,
                                        root_dir=args.root_dir,
-                                       is_training=not evaluate,
+                                       # is_training=not evaluate,
+                                       is_training=True,
                                        tokenizer=tokenizer,
                                        simplify=False,
                                        max_depth=max_depth)
@@ -337,13 +337,13 @@ def load_and_cache_examples(args, tokenizer, max_depth=50, evaluate=False, outpu
         # plt.savefig('num_node_spans.png')
         # plt.close()
 
-
         features = convert_examples_to_features(examples=examples,
                                                 tokenizer=tokenizer,
                                                 max_seq_length=args.max_seq_length,
                                                 doc_stride=args.doc_stride,
                                                 max_query_length=args.max_query_length,
-                                                is_training=not evaluate,
+                                                # is_training=not evaluate,
+                                                is_training=True,
                                                 cls_token=tokenizer.cls_token,
                                                 sep_token=tokenizer.sep_token,
                                                 pad_token=tokenizer.pad_token_id,
@@ -369,57 +369,55 @@ def load_and_cache_examples(args, tokenizer, max_depth=50, evaluate=False, outpu
     all_xpath_tags_seq = torch.tensor([f.xpath_tags_seq for f in features], dtype=torch.long)
     all_xpath_subs_seq = torch.tensor([f.xpath_subs_seq for f in features], dtype=torch.long)
 
-    if evaluate:
-        all_feature_index = torch.arange(all_input_ids.size(0), dtype=torch.long)
-        dataset = StrucDataset(all_input_ids, all_input_mask, all_segment_ids, all_feature_index,
-                               all_xpath_tags_seq, all_xpath_subs_seq, )
-    else:
-        # 训练模式，每个case选择一个正例和随机k-1个负例
-        all_node_spans = []
-        all_is_answer_node = []
-        all_query_span = []
-        for f in features:
-            # 
-            node_spans, is_answer_node = f.node_spans, f.is_answer_node 
-            # 
-            node_num = len(node_spans)
-            _node_spans = []
-            _is_answer_node = []
-            # 找出正样本
-            for span, label in zip(node_spans, is_answer_node):
-                if label == 1:
-                    _node_spans.append(span)
-                    _is_answer_node.append(1)
-                    break
-            # 已经有一个node了
-            cnt = 1
-            # 随机负样本
-            while cnt + node_num <= args.num_node_spans_per_case:
-                _node_spans.extend(node_spans)
-                _is_answer_node.extend(is_answer_node)
-                cnt += node_num
-            selected_indices = np.random.choice(node_num, args.num_node_spans_per_case-cnt, replace=False)
-            for i in selected_indices:
-                _node_spans.append(node_spans[i])
-                _is_answer_node.append(is_answer_node[i])
-            # 添加到全体
-            all_node_spans.append(_node_spans)
-            all_is_answer_node.append(_is_answer_node)
-            all_query_span.append(f.query_span)
-        
-        all_query_span = torch.tensor(all_query_span, dtype=torch.long)
-        all_node_spans = torch.tensor(all_node_spans, dtype=torch.long)
-        all_is_answer_node = torch.tensor(all_is_answer_node, dtype=torch.long)
-        # all_num_nodes = torch.tensor([args.num_node_spans_per_case for _ in range(all_input_ids.size(0))], dtype=torch.long)
-        # 
-        # all_start_positions = torch.tensor([f.start_position for f in features], dtype=torch.long)
-        # all_end_positions = torch.tensor([f.end_position for f in features], dtype=torch.long)
-        dataset = StrucDataset(all_input_ids, all_input_mask, all_segment_ids,
-                               all_xpath_tags_seq, all_xpath_subs_seq,
-                               all_node_spans, all_is_answer_node, all_query_span)
+    # if evaluate:
+    #     all_feature_index = torch.arange(all_input_ids.size(0), dtype=torch.long)
+    #     dataset = StrucDataset(all_input_ids, all_input_mask, all_segment_ids, all_feature_index,
+    #                            all_xpath_tags_seq, all_xpath_subs_seq, )
+    # else:
+    # 训练模式，每个case选择一个正例和随机k-1个负例
+    all_node_spans = []
+    all_is_answer_node = []
+    all_query_span = []
+    for f in features:
+        node_spans, is_answer_node = f.node_spans, f.is_answer_node 
+        node_num = len(node_spans)
+        _node_spans = []
+        _is_answer_node = []
+        # 找出正样本(一定有一个正样本)
+        for span, label in zip(node_spans, is_answer_node):
+            if label == 1:
+                _node_spans.append(span)
+                _is_answer_node.append(1)
+                break
+        assert len(_node_spans) == len(_is_answer_node) == 1
+        # 已经有一个node了
+        cnt = 1
+        # 随机负样本
+        while cnt + node_num <= args.num_node_spans_per_case:
+            _node_spans.extend(node_spans)
+            _is_answer_node.extend(is_answer_node)
+            cnt += node_num
+        selected_indices = np.random.choice(node_num, args.num_node_spans_per_case-cnt, replace=False)
+        for i in selected_indices:
+            _node_spans.append(node_spans[i])
+            _is_answer_node.append(is_answer_node[i])
+        # 添加到全体
+        all_node_spans.append(_node_spans)
+        all_is_answer_node.append(_is_answer_node)
+        all_query_span.append(f.query_span)
+    
+    all_query_span = torch.tensor(all_query_span, dtype=torch.long)
+    all_node_spans = torch.tensor(all_node_spans, dtype=torch.long)
+    all_is_answer_node = torch.tensor(all_is_answer_node, dtype=torch.long)
+    # all_num_nodes = torch.tensor([args.num_node_spans_per_case for _ in range(all_input_ids.size(0))], dtype=torch.long)
+    # all_start_positions = torch.tensor([f.start_position for f in features], dtype=torch.long)
+    # all_end_positions = torch.tensor([f.end_position for f in features], dtype=torch.long)
+    dataset = StrucDataset(all_input_ids, all_input_mask, all_segment_ids,
+                            all_xpath_tags_seq, all_xpath_subs_seq,
+                            all_node_spans, all_is_answer_node, all_query_span)
 
-    if output_examples:
-        dataset = (dataset, examples, features)
+    # if output_examples:
+    #     dataset = (dataset, examples, features)
     
     return dataset
 
@@ -480,7 +478,7 @@ def main():
                         help="Only evaluate the checkpoints with prefix smaller than it, beside the final checkpoint "
                              "with no prefix")
     
-    parser.add_argument("--dataloader_workers", default=8, type=int,
+    parser.add_argument("--dataloader_workers", default=16, type=int,
                         help="Number of dataloader worker for evaluation.")
     parser.add_argument("--per_gpu_train_batch_size", default=8, type=int,
                         help="Batch size per GPU/CPU for training.")
@@ -616,8 +614,9 @@ def main():
         torch.save(args, os.path.join(args.output_dir, 'training_args.bin'))
 
     # Evaluation - we can ask to evaluate all the checkpoints (sub-directories) in a directory
-    results = {}
+    # results = {}
     if args.do_eval and args.local_rank in [-1, 0]:
+        # 
         checkpoints = [args.output_dir]
         if args.eval_all_checkpoints:
             checkpoints = list(
@@ -625,8 +624,11 @@ def main():
             logging.getLogger("transformers.modeling_utils").setLevel(logging.WARN)  # Reduce model loading logs
 
         logger.info("Evaluate the following checkpoints: %s", checkpoints)
-        config = MarkupLMConfig.from_pretrained(args.output_dir)
+        # config = MarkupLMConfig.from_pretrained(args.output_dir)
         tokenizer = MarkupLMTokenizer.from_pretrained(args.output_dir)
+
+        # load eval dataset
+        eval_dataset = load_and_cache_examples(args, tokenizer, max_depth=max_depth, evaluate=True, output_examples=False)
 
         for checkpoint in checkpoints:
             # Reload the model
@@ -643,14 +645,15 @@ def main():
             model.to(args.device)
 
             # Evaluate
-            result = evaluate(args, model, tokenizer, max_depth=max_depth, prefix=global_step)
+            evaluate(args, eval_dataset, model, tokenizer, max_depth=max_depth, prefix=global_step)
+            # result = evaluate(args, model, tokenizer, max_depth=max_depth, prefix=global_step)
 
-            result = dict((k + ('_{}'.format(global_step) if global_step else ''), v) for k, v in result.items())
-            results.update(result)
+            # result = dict((k + ('_{}'.format(global_step) if global_step else ''), v) for k, v in result.items())
+            # results.update(result)
 
-    logger.info("Results: {}".format(results))
+    # logger.info("Results: {}".format(results))
 
-    return results
+    # return results
 
 
 if __name__ == "__main__":

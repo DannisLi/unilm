@@ -21,6 +21,7 @@ import torch
 import torch.utils.checkpoint
 from torch import nn
 from torch.nn import CrossEntropyLoss
+import torch.nn.functional as F
 
 from transformers.activations import ACT2FN
 from transformers.file_utils import add_start_docstrings, add_start_docstrings_to_model_forward, \
@@ -1125,6 +1126,21 @@ def create_position_ids_from_input_ids(input_ids, padding_idx, past_key_values_l
     return incremental_indices.long() + padding_idx
 
 
+def focal_loss(inputs, targets, alpha, gamma:float=0., ignore_index:int=-100):
+    # inputs: (N, C)
+    # targets: (N, )
+    if gamma == 0.:
+        return F.cross_entropy(inputs, targets, weight=alpha, ignore_index=ignore_index)
+    else:
+        # print ("before:", inputs.shape, targets.shape)
+        case_ids = (targets != ignore_index).nonzero(as_tuple=True)[0]
+        inputs = inputs[case_ids]
+        targets = targets[case_ids]
+        ce = F.cross_entropy(inputs, targets, weight=alpha, reduce=False)
+        prob = torch.gather(F.softmax(inputs, dim=1), 1, targets.view(-1,1)).squeeze(dim=1)
+        return torch.mean(ce * (1. - prob)**gamma)
+
+
 class MarkupLMForNodeClassification(MarkupLMPreTrainedModel):
 
     def __init__(self, config):
@@ -1132,21 +1148,20 @@ class MarkupLMForNodeClassification(MarkupLMPreTrainedModel):
         self.hidden_size = config.hidden_size
         self.num_labels = config.num_labels
 
-        # print (self.num_labels)
-
         self.markuplm = MarkupLMModel(config, add_pooling_layer=False)
         self.classifiers = nn.ModuleList([self.build_classifier() for _ in range(config.num_hidden_layers+1)])
-        self.loss_fct = CrossEntropyLoss()
+        self.register_buffer("class_weight", torch.tensor([1., 20.]))
+        self.loss_fct = CrossEntropyLoss(weight=self.class_weight, ignore_index=-100)
 
         self.init_weights()
     
     def build_classifier(self):
         return nn.Sequential(
             nn.Linear(self.hidden_size*2, self.hidden_size),
-            nn.Dropout(),
+            # nn.Dropout(),
             nn.GELU(),
             nn.Linear(self.hidden_size, self.hidden_size),
-            nn.Dropout(),
+            # nn.Dropout(),
             nn.GELU(),
             nn.Linear(self.hidden_size, self.num_labels),
         )
@@ -1209,18 +1224,11 @@ class MarkupLMForNodeClassification(MarkupLMPreTrainedModel):
             hidden_states[b]
             # 当前case的query embeddings: [num_layers * dim]
             query_rep_case = hidden_states[b, :, query_span[b,0]:query_span[b,1]].mean(dim=1)
-            # torch.stack([h[b, query_span[b,0]:query_span[b,1]].mean(dim=0) for h in hidden_states], dim=0)
             query_rep.append(query_rep_case)
             # 当前case的节点数和spans
             node_spans_case = node_spans[b]    # [max_num_nodes * 2]
             # 当前case的所有nodes的embedings: [num_layers * max_num_nodes * dim]
             node_reps_case = torch.stack([hidden_states[b, :, sp[0]:sp[1]].mean(dim=1) for sp in node_spans_case], dim=1)
-            # node_reps_case = []
-            # for h in hidden_states:
-            #     # max_num_nodes * dim
-            #     tmp = torch.stack([h[b, sp[0]:sp[1]].mean(dim=0) for sp in node_spans_case], dim=0)
-            #     node_reps_case.append(tmp)
-            # node_reps_case = torch.stack(node_reps_case, dim=0)
             node_reps.append(node_reps_case)
         
         # query_rep: [batch_size * num_layers * dim] & node_reps: [batch_size * num_layers * max_num_nodes * dim]
