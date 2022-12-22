@@ -58,8 +58,7 @@ class SRCExample(object):
                             include the token at end_position.
         tok_to_orig_index (list[int]): the mapping from sub-tokens (all_doc_tokens) to origin tokens (doc_tokens).
         orig_to_tok_index (list[int]): the mapping from origin tokens (doc_tokens) to sub-tokens (all_doc_tokens).
-        tok_to_tags_index (list[int]): the mapping from sub-tokens (all_doc_tokens) to the id of the deepest tag it
-                                       belongs to.
+        tok_to_tags_index (list[int]): the mapping from sub-tokens (all_doc_tokens) to the id of the deepest tag it belongs to.
     """
 
     # the difference between T-PLM and H-PLM is just add <xx> and </xx> into the

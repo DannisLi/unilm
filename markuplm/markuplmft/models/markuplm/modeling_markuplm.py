@@ -1157,6 +1157,7 @@ class MarkupLMForNodeClassification(MarkupLMPreTrainedModel):
     
     def build_classifier(self):
         return nn.Sequential(
+            nn.Dropout(0.5),
             nn.Linear(self.hidden_size*2, self.hidden_size),
             # nn.Dropout(),
             nn.GELU(),
@@ -1175,7 +1176,7 @@ class MarkupLMForNodeClassification(MarkupLMPreTrainedModel):
             position_ids=None,
             head_mask=None,
             inputs_embeds=None,
-            # num_nodes=None,
+            num_nodes=None,
             node_spans=None,
             node_labels=None,
             query_span=None,
@@ -1184,6 +1185,7 @@ class MarkupLMForNodeClassification(MarkupLMPreTrainedModel):
             return_dict=None,
             xpath_tags_seq=None,
             xpath_subs_seq=None,
+            max_num_nodes = 128,
         ):
         '''
         num_nodes[bs]: the number of DOM nodes
@@ -1212,12 +1214,10 @@ class MarkupLMForNodeClassification(MarkupLMPreTrainedModel):
         # [batch_size * num_layer * seq_len * dim]
         hidden_states = torch.stack(outputs.hidden_states, dim=0).transpose(0, 1)
         # hidden_states = outputs.hidden_states
-        max_num_nodes = node_labels.shape[1]
+        # max_num_nodes = node_labels.shape[1]
         batch_size = node_labels.shape[0]
 
-
         logits, loss = [], []
-
         query_rep = []
         node_reps = []
         for b in range(batch_size):
@@ -1226,16 +1226,20 @@ class MarkupLMForNodeClassification(MarkupLMPreTrainedModel):
             query_rep_case = hidden_states[b, :, query_span[b,0]:query_span[b,1]].mean(dim=1)
             query_rep.append(query_rep_case)
             # 当前case的节点数和spans
-            node_spans_case = node_spans[b]    # [max_num_nodes * 2]
-            # 当前case的所有nodes的embedings: [num_layers * max_num_nodes * dim]
+            num_nodes_case = num_nodes[b].item()
+            node_spans_case = node_spans[b, :num_nodes_case]    # [num_nodes * 2]
+            # 当前case的所有nodes的embedings: [num_layers * num_nodes * dim]
             node_reps_case = torch.stack([hidden_states[b, :, sp[0]:sp[1]].mean(dim=1) for sp in node_spans_case], dim=1)
+            # pad to [num_layers * max_num_nodes * dim]
+            # print (max_num_nodes, num_nodes_case, node_reps_case.shape)
+            node_reps_case = F.pad(node_reps_case, (0, 0, 0, max_num_nodes-num_nodes_case, 0, 0), "constant", 0)
+            # print (max_num_nodes, node_reps_case.shape)
             node_reps.append(node_reps_case)
         
         # query_rep: [batch_size * num_layers * dim] & node_reps: [batch_size * num_layers * max_num_nodes * dim]
         query_rep = torch.stack(query_rep, dim=0)
         node_reps = torch.stack(node_reps, dim=0)
 
-        # print ("query_rep:", query_rep.shape, "node_reps:", node_reps.shape)
         # cat query and node reps
         cls_inputs = torch.cat((query_rep.unsqueeze(2).repeat(1,1,max_num_nodes,1), node_reps), dim=3)
 

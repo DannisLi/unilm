@@ -9,4 +9,5 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 python run_cls.py \
 	--max_query_length 42 \
 	--max_seq_length 512 \
 	--per_gpu_eval_batch_size 64 \
-	--num_node_spans_per_case 384
+	--num_nodes_per_case 128 \
+	--k 20

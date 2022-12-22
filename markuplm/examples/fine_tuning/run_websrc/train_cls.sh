@@ -5,11 +5,10 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python run_cls.py \
 	--model_name_or_path microsoft/markuplm-base \
 	--output_dir /home/v-lizimeng/unilm/markuplm/examples/fine_tuning/run_websrc/results_cls \
 	--do_train \
-	--save_steps 1500 \
+	--save_steps 100 \
 	--max_query_length 42 \
 	--max_seq_length 512 \
-	--per_gpu_train_batch_size 8 \
-	--per_gpu_eval_batch_size 16 \
-	--num_node_spans_per_case 512 \
-	--warmup_ratio 0.1 \
-	--num_train_epochs 10
+	--per_gpu_train_batch_size 4 \
+	--num_nodes_per_case 96 \
+	--warmup_ratio 0.15 \
+	--num_train_epochs 2

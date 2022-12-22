@@ -119,7 +119,6 @@ class MarkupLMConfig(RobertaConfig):
             layer_norm_eps=1e-12,
             pad_token_id=0,
             gradient_checkpointing=False,
-
             max_xpath_tag_unit_embeddings=256,
             max_xpath_subs_unit_embeddings=1024,
             xpath_unit_hidden_size=32,

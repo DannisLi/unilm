@@ -1,5 +1,6 @@
 from __future__ import absolute_import, division, print_function
 
+import re
 import sys
 import argparse
 import logging
@@ -7,6 +8,7 @@ import os
 import random
 import glob
 import timeit
+import copy
 
 import numpy as np
 import torch
@@ -129,6 +131,8 @@ def train(args, train_dataset, model, tokenizer):
                       'node_spans': batch[5],
                       'node_labels': batch[6],
                       'query_span': batch[7],
+                      'num_nodes': batch[8],
+                      'max_num_nodes': args.num_nodes_per_case,
                       }
 
             outputs = model(**inputs)
@@ -204,10 +208,6 @@ def evaluate(args, eval_dataset, model, tokenizer, max_depth, prefix=""):
     r"""
     Evaluate the model
     """
-    # dataset, examples, features = load_and_cache_examples(args, tokenizer, max_depth=max_depth, evaluate=True,
-    #                                                       output_examples=True)
-    # eval_dataset = load_and_cache_examples(args, tokenizer, max_depth=max_depth, evaluate=True,
-    #                                                       output_examples=False)
 
     if not os.path.exists(args.output_dir) and args.local_rank in [-1, 0]:
         os.makedirs(args.output_dir)
@@ -229,7 +229,7 @@ def evaluate(args, eval_dataset, model, tokenizer, max_depth, prefix=""):
     all_results = []
     # start_time = timeit.default_timer()
     # list of list: cases * layers
-    page_percision = []
+    # page_percision = []
     page_recall = []
     # for batch in tqdm(eval_dataloader, desc="Evaluating"):
     for batch in eval_dataloader:
@@ -244,28 +244,40 @@ def evaluate(args, eval_dataset, model, tokenizer, max_depth, prefix=""):
                       'node_spans': batch[5],
                       'node_labels': batch[6],
                       'query_span': batch[7],
+                      'num_nodes': batch[8],
+                      'max_num_nodes': args.num_nodes_per_case,
                       }
 
             outputs = model(**inputs)
-            logits = outputs[0]    # [bs*layers*max_num_nodes*num_labels]
+            logits = outputs[0].detach().cpu().numpy()    # [bs*layers*max_num_nodes*num_labels]
             # logit[i] > 0 -> pred = i: [bs*layers*max_num_nodes]
             # preds: [bs*layers*max_num_nodes], 
-            preds = (logits[:,:,:,1] > 0).long().detach().cpu().numpy()
+            # preds = (logits[:,:,:,1] > 0).long().detach().cpu().numpy()
             labels = batch[6].cpu().numpy()    # [bs * max_num_nodes]
-
+            num_nodes = batch[8].cpu().numpy()    # [bs]
+            del outputs
+        # print (logits.shape, labels.shape, num_nodes)
+        # sys.stdout.flush()
         # 计算每个page上的percision & recall
-        for page_preds, page_labels in zip(preds, labels):
-            # page_preds: [layers * nodes]
-            # page_labels: [nodes]
-            tmp = (page_preds * page_labels).sum(1)
-            # page_percision.append(tmp / page_preds.sum(1))
-            page_recall.append(tmp / page_labels.sum())
+        for page_logits, page_labels, page_num_nodes in zip(logits, labels, num_nodes):
+            # page_preds: [layers*max_num_nodes*num_labels]
+            # page_labels: [max_num_nodes]
+            page_logits = page_logits[:,:page_num_nodes,1]    # [layers*num_nodes]
+            page_labels = page_labels[:page_num_nodes]        # [num_nodes]
+            # nodes whose scores in top k are positive, others are negative 
+            preds = page_logits.argsort(axis=1)[:, -args.k:]     # 最大的k个节点的index: [layers * k]
+            _recall = []
+            for layer_preds in preds:
+                _recall.append(0.)
+                for x in layer_preds:
+                    if page_labels[x]:
+                        _recall[-1] = 1.
+                        break
+            page_recall.append(_recall)
         
-        # 
-        del batch, inputs, outputs, logits
-        
-    # page_percision = np.array(page_percision)
+    # [cases * layers]
     page_recall = np.array(page_recall)
+
     # print ("Percision:", page_percision.mean(0))
     print ("Recall:", page_recall.mean(0))
 
@@ -364,62 +376,104 @@ def load_and_cache_examples(args, tokenizer, max_depth=50, evaluate=False, outpu
     all_input_mask = torch.tensor([f.input_mask for f in features], dtype=torch.long)
     all_segment_ids = torch.tensor([f.segment_ids for f in features], dtype=torch.long)
 
-    # print (all_input_ids.shape, all_input_mask.shape, all_segment_ids.shape)
-
     all_xpath_tags_seq = torch.tensor([f.xpath_tags_seq for f in features], dtype=torch.long)
     all_xpath_subs_seq = torch.tensor([f.xpath_subs_seq for f in features], dtype=torch.long)
 
-    # if evaluate:
-    #     all_feature_index = torch.arange(all_input_ids.size(0), dtype=torch.long)
-    #     dataset = StrucDataset(all_input_ids, all_input_mask, all_segment_ids, all_feature_index,
-    #                            all_xpath_tags_seq, all_xpath_subs_seq, )
-    # else:
-    # 训练模式，每个case选择一个正例和随机k-1个负例
-    all_node_spans = []
-    all_is_answer_node = []
-    all_query_span = []
-    for f in features:
-        node_spans, is_answer_node = f.node_spans, f.is_answer_node 
-        node_num = len(node_spans)
-        _node_spans = []
-        _is_answer_node = []
-        # 找出正样本(一定有一个正样本)
-        for span, label in zip(node_spans, is_answer_node):
-            if label == 1:
-                _node_spans.append(span)
-                _is_answer_node.append(1)
-                break
-        assert len(_node_spans) == len(_is_answer_node) == 1
-        # 已经有一个node了
-        cnt = 1
-        # 随机负样本
-        while cnt + node_num <= args.num_node_spans_per_case:
-            _node_spans.extend(node_spans)
-            _is_answer_node.extend(is_answer_node)
-            cnt += node_num
-        selected_indices = np.random.choice(node_num, args.num_node_spans_per_case-cnt, replace=False)
-        for i in selected_indices:
-            _node_spans.append(node_spans[i])
-            _is_answer_node.append(is_answer_node[i])
-        # 添加到全体
-        all_node_spans.append(_node_spans)
-        all_is_answer_node.append(_is_answer_node)
-        all_query_span.append(f.query_span)
-    
-    all_query_span = torch.tensor(all_query_span, dtype=torch.long)
-    all_node_spans = torch.tensor(all_node_spans, dtype=torch.long)
-    all_is_answer_node = torch.tensor(all_is_answer_node, dtype=torch.long)
-    # all_num_nodes = torch.tensor([args.num_node_spans_per_case for _ in range(all_input_ids.size(0))], dtype=torch.long)
+    if evaluate:
+        # 推断模式
+        all_node_spans = []
+        all_is_answer_node = []
+        all_query_span = []
+        all_num_nodes = []
+        for f in features:
+            node_spans, is_answer_node = f.node_spans, f.is_answer_node
+            node_num = len(node_spans)
+            if node_num <= args.num_nodes_per_case:
+                _node_spans = copy.deepcopy(node_spans)
+                _is_answer_node = copy.deepcopy(is_answer_node)
+                # pad the last one
+                for _ in range(args.num_nodes_per_case-node_num):
+                    _node_spans.append(node_spans[-1])
+                    _is_answer_node.append(-100)
+            else:
+                _node_spans = []
+                _is_answer_node = []
+                # 找出正样本(一定有一个正样本)
+                for pos_ind, (span, label) in enumerate(zip(node_spans, is_answer_node)):
+                    if label == 1:
+                        _node_spans.append(span)
+                        _is_answer_node.append(1)
+                        break
+                # assert len(_node_spans) == len(_is_answer_node) == 1
+                ind_list = list(range(len(node_spans)))
+                ind_list.remove(pos_ind)
+                neg_inds = np.random.choice(ind_list, args.num_nodes_per_case-1, replace=False)
+                _node_spans.extend([node_spans[i] for i in neg_inds])
+                _is_answer_node.extend([is_answer_node[i] for i in neg_inds])
+            # 添加到全体
+            all_node_spans.append(_node_spans)
+            all_is_answer_node.append(_is_answer_node)
+            all_query_span.append(f.query_span)
+            all_num_nodes.append(min(node_num, args.num_nodes_per_case))
+        
+        all_query_span = torch.tensor(all_query_span, dtype=torch.long)
+        all_node_spans = torch.tensor(all_node_spans, dtype=torch.long)
+        all_is_answer_node = torch.tensor(all_is_answer_node, dtype=torch.long)
+        all_num_nodes = torch.tensor(all_num_nodes, dtype=torch.long)
+    else:
+        # 训练模式，每个case选择一个pos cases和随机k-1个cases
+        all_node_spans = []
+        all_is_answer_node = []
+        all_query_span = []
+        for f in features:
+            node_spans, is_answer_node = f.node_spans, f.is_answer_node 
+            node_num = len(node_spans)
+            _node_spans = []
+            _is_answer_node = []
+            # 找出正样本(一定有一个正样本)
+            for span, label in zip(node_spans, is_answer_node):
+                if label == 1:
+                    _node_spans.append(span)
+                    _is_answer_node.append(1)
+                    break
+            assert len(_node_spans) == len(_is_answer_node) == 1
+            # 已经有一个node了
+            cnt = 1
+            # 随机负样本
+            while cnt + node_num <= args.num_nodes_per_case:
+                _node_spans.extend(node_spans)
+                _is_answer_node.extend(is_answer_node)
+                cnt += node_num
+            selected_indices = np.random.choice(node_num, args.num_nodes_per_case-cnt, replace=False)
+            for i in selected_indices:
+                _node_spans.append(node_spans[i])
+                _is_answer_node.append(is_answer_node[i])
+            # 添加到全体
+            all_node_spans.append(_node_spans)
+            all_is_answer_node.append(_is_answer_node)
+            all_query_span.append(f.query_span)
+        
+        all_query_span = torch.tensor(all_query_span, dtype=torch.long)
+        all_node_spans = torch.tensor(all_node_spans, dtype=torch.long)
+        all_is_answer_node = torch.tensor(all_is_answer_node, dtype=torch.long)
+        all_num_nodes = torch.tensor([args.num_nodes_per_case for _ in range(all_input_ids.size(0))], dtype=torch.long)
     # all_start_positions = torch.tensor([f.start_position for f in features], dtype=torch.long)
     # all_end_positions = torch.tensor([f.end_position for f in features], dtype=torch.long)
     dataset = StrucDataset(all_input_ids, all_input_mask, all_segment_ids,
                             all_xpath_tags_seq, all_xpath_subs_seq,
-                            all_node_spans, all_is_answer_node, all_query_span)
+                            all_node_spans, all_is_answer_node, all_query_span, all_num_nodes)
 
     # if output_examples:
     #     dataset = (dataset, examples, features)
     
     return dataset
+
+def is_integer(x:str):
+    try:
+        int(x)
+        return True
+    except:
+        return False
 
 
 def main():
@@ -528,7 +582,8 @@ def main():
                              "See details at https://nvidia.github.io/apex/amp.html")
     parser.add_argument('--server_ip', type=str, default='', help="Can be used for distant debugging.")
     parser.add_argument('--server_port', type=str, default='', help="Can be used for distant debugging.")
-    parser.add_argument('--num_node_spans_per_case', type=int, default=16, help="The number of node spans per case during training.")
+    parser.add_argument('--num_nodes_per_case', type=int, default=16, help="The number of node spans per case during training.")
+    parser.add_argument('--k', type=int, default=5, help="Recall @ k.")
     args = parser.parse_args()
 
     if os.path.exists(args.output_dir) and os.listdir(
@@ -621,6 +676,9 @@ def main():
         if args.eval_all_checkpoints:
             checkpoints = list(
                 os.path.dirname(c) for c in sorted(glob.glob(args.output_dir + '/**/' + WEIGHTS_NAME, recursive=True)))
+            # 排个序
+            checkpoints = filter(lambda p: re.match(r'checkpoint-\d+', os.path.basename(p)), checkpoints)
+            checkpoints = sorted(checkpoints, key=lambda x: int(x.split('-')[-1]))
             logging.getLogger("transformers.modeling_utils").setLevel(logging.WARN)  # Reduce model loading logs
 
         logger.info("Evaluate the following checkpoints: %s", checkpoints)
