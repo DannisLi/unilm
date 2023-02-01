@@ -1155,6 +1155,7 @@ class MarkupLMForNodeClassification(MarkupLMPreTrainedModel):
 
         self.init_weights()
     
+
     def build_classifier(self):
         return nn.Sequential(
             nn.Dropout(0.5),
@@ -1193,7 +1194,6 @@ class MarkupLMForNodeClassification(MarkupLMPreTrainedModel):
         node_spans[bs*max_num_nodes*2]: the boundaries of DOM nodes
         query_span[bs*2]: 
         '''
-        # print ("input_ids:", input_ids.shape, "node_spans:", node_spans.shape, "node_labels:", node_labels.shape, "query_span:", query_span.shape)
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
@@ -1252,7 +1252,6 @@ class MarkupLMForNodeClassification(MarkupLMPreTrainedModel):
             # loss for layer
             loss.append(self.loss_fct(preds.view(-1, self.num_labels), node_labels.view(-1)))
         
-
         logits = torch.stack(logits, dim=1)                # [bs*layers*max_num_nodes*num_labels]
         loss = torch.stack(loss, dim=0).unsqueeze(0)        # [1 * layers]
 

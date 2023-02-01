@@ -52,7 +52,7 @@ def to_list(tensor):
     return tensor.detach().cpu().tolist()
 
 
-def train(args, train_dataset, model, tokenizer):
+def train(args, train_dataset, model, tokenizer, max_depth):
     r"""
     Train the model
     """
@@ -129,9 +129,9 @@ def train(args, train_dataset, model, tokenizer):
                       'xpath_tags_seq': batch[3],
                       'xpath_subs_seq': batch[4],
                       'node_spans': batch[5],
-                      'node_labels': batch[6],
-                      'query_span': batch[7],
-                      'num_nodes': batch[8],
+                      'node_labels': batch[7],
+                      'query_span': batch[8],
+                      'num_nodes': batch[9],
                       'max_num_nodes': args.num_nodes_per_case,
                       }
 
@@ -242,9 +242,9 @@ def evaluate(args, eval_dataset, model, tokenizer, max_depth, prefix=""):
                       'xpath_tags_seq': batch[3],
                       'xpath_subs_seq': batch[4],
                       'node_spans': batch[5],
-                      'node_labels': batch[6],
-                      'query_span': batch[7],
-                      'num_nodes': batch[8],
+                      'node_labels': batch[7],
+                      'query_span': batch[8],
+                      'num_nodes': batch[9],
                       'max_num_nodes': args.num_nodes_per_case,
                       }
 
@@ -253,8 +253,9 @@ def evaluate(args, eval_dataset, model, tokenizer, max_depth, prefix=""):
             # logit[i] > 0 -> pred = i: [bs*layers*max_num_nodes]
             # preds: [bs*layers*max_num_nodes], 
             # preds = (logits[:,:,:,1] > 0).long().detach().cpu().numpy()
-            labels = batch[6].cpu().numpy()    # [bs * max_num_nodes]
-            num_nodes = batch[8].cpu().numpy()    # [bs]
+            # labels = batch[6].cpu().numpy()    # [bs * max_num_nodes]
+            labels = batch[7].cpu().numpy()    # [bs * max_num_nodes]
+            num_nodes = batch[9].cpu().numpy()    # [bs]
             del outputs
         # print (logits.shape, labels.shape, num_nodes)
         # sys.stdout.flush()
@@ -326,28 +327,6 @@ def load_and_cache_examples(args, tokenizer, max_depth=50, evaluate=False, outpu
                                        tokenizer=tokenizer,
                                        simplify=False,
                                        max_depth=max_depth)
-        
-        # hist: number of tokens
-        # logger.info("Drawing the histogram for number of tokens")
-        # page_len_list = sorted([len(e.all_doc_tokens) for e in examples], reverse=True)
-        # plt.hist(page_len_list[int(0.1*len(page_len_list)):], bins=30)
-        # plt.savefig('page_len.png')
-        # plt.close()
-        # c1, c2 = 0, 0
-        # for x in page_len_list:
-        #     if x <= 467:
-        #         c1 += 1
-        #         c2 += 1
-        #     elif x <=508:
-        #         c2 += 1
-        # print (c1, c2, len(page_len_list), c1 / len(page_len_list), c2 / len(page_len_list))
-
-        # hist: number of nodes
-        # logger.info("Drawing the histogram for number of nodes")
-        # num_node_spans_list = sorted([len(e.node_spans) for e in examples], reverse=True)
-        # plt.hist(num_node_spans_list[int(0.05*len(num_node_spans_list)):], bins=30)
-        # plt.savefig('num_node_spans.png')
-        # plt.close()
 
         features = convert_examples_to_features(examples=examples,
                                                 tokenizer=tokenizer,
@@ -383,26 +362,31 @@ def load_and_cache_examples(args, tokenizer, max_depth=50, evaluate=False, outpu
         # 推断模式
         all_node_spans = []
         all_is_answer_node = []
+        all_intersect_with_answer = []
         all_query_span = []
         all_num_nodes = []
         for f in features:
-            node_spans, is_answer_node = f.node_spans, f.is_answer_node
+            node_spans, is_answer_node, intersect_with_answer = f.node_spans, f.is_answer_node, f.intersect_with_answer
             node_num = len(node_spans)
             if node_num <= args.num_nodes_per_case:
                 _node_spans = copy.deepcopy(node_spans)
                 _is_answer_node = copy.deepcopy(is_answer_node)
+                _intersect_with_answer = copy.deepcopy(intersect_with_answer)
                 # pad the last one
                 for _ in range(args.num_nodes_per_case-node_num):
                     _node_spans.append(node_spans[-1])
                     _is_answer_node.append(-100)
+                    _intersect_with_answer.append(-100)
             else:
                 _node_spans = []
                 _is_answer_node = []
+                _intersect_with_answer = []
                 # 找出正样本(一定有一个正样本)
                 for pos_ind, (span, label) in enumerate(zip(node_spans, is_answer_node)):
                     if label == 1:
                         _node_spans.append(span)
                         _is_answer_node.append(1)
+                        _intersect_with_answer.append(1)
                         break
                 # assert len(_node_spans) == len(_is_answer_node) == 1
                 ind_list = list(range(len(node_spans)))
@@ -410,31 +394,40 @@ def load_and_cache_examples(args, tokenizer, max_depth=50, evaluate=False, outpu
                 neg_inds = np.random.choice(ind_list, args.num_nodes_per_case-1, replace=False)
                 _node_spans.extend([node_spans[i] for i in neg_inds])
                 _is_answer_node.extend([is_answer_node[i] for i in neg_inds])
+                _intersect_with_answer.extend([intersect_with_answer[i] for i in neg_inds])
             # 添加到全体
             all_node_spans.append(_node_spans)
             all_is_answer_node.append(_is_answer_node)
+            all_intersect_with_answer.append(_intersect_with_answer)
             all_query_span.append(f.query_span)
             all_num_nodes.append(min(node_num, args.num_nodes_per_case))
         
         all_query_span = torch.tensor(all_query_span, dtype=torch.long)
         all_node_spans = torch.tensor(all_node_spans, dtype=torch.long)
         all_is_answer_node = torch.tensor(all_is_answer_node, dtype=torch.long)
+        all_intersect_with_answer = torch.tensor(all_intersect_with_answer, dtype=torch.long)
         all_num_nodes = torch.tensor(all_num_nodes, dtype=torch.long)
     else:
         # 训练模式，每个case选择一个pos cases和随机k-1个cases
         all_node_spans = []
         all_is_answer_node = []
+        all_intersect_with_answer = []
         all_query_span = []
         for f in features:
-            node_spans, is_answer_node = f.node_spans, f.is_answer_node 
+            node_spans, is_answer_node, intersect_with_answer = f.node_spans, f.is_answer_node, f.intersect_with_answer
+            # print (intersect_with_answer)
             node_num = len(node_spans)
+            assert node_num == len(is_answer_node)
+            assert node_num == len(intersect_with_answer)
             _node_spans = []
             _is_answer_node = []
+            _intersect_with_answer = []
             # 找出正样本(一定有一个正样本)
             for span, label in zip(node_spans, is_answer_node):
                 if label == 1:
                     _node_spans.append(span)
                     _is_answer_node.append(1)
+                    _intersect_with_answer.append(1)
                     break
             assert len(_node_spans) == len(_is_answer_node) == 1
             # 已经有一个node了
@@ -443,25 +436,30 @@ def load_and_cache_examples(args, tokenizer, max_depth=50, evaluate=False, outpu
             while cnt + node_num <= args.num_nodes_per_case:
                 _node_spans.extend(node_spans)
                 _is_answer_node.extend(is_answer_node)
+                _intersect_with_answer.extend(intersect_with_answer)
                 cnt += node_num
             selected_indices = np.random.choice(node_num, args.num_nodes_per_case-cnt, replace=False)
             for i in selected_indices:
                 _node_spans.append(node_spans[i])
                 _is_answer_node.append(is_answer_node[i])
+                _intersect_with_answer.append(intersect_with_answer[i])
             # 添加到全体
             all_node_spans.append(_node_spans)
             all_is_answer_node.append(_is_answer_node)
+            all_intersect_with_answer.append(_intersect_with_answer)
             all_query_span.append(f.query_span)
         
         all_query_span = torch.tensor(all_query_span, dtype=torch.long)
         all_node_spans = torch.tensor(all_node_spans, dtype=torch.long)
         all_is_answer_node = torch.tensor(all_is_answer_node, dtype=torch.long)
+        all_intersect_with_answer = torch.tensor(all_intersect_with_answer, dtype=torch.long)
         all_num_nodes = torch.tensor([args.num_nodes_per_case for _ in range(all_input_ids.size(0))], dtype=torch.long)
     # all_start_positions = torch.tensor([f.start_position for f in features], dtype=torch.long)
     # all_end_positions = torch.tensor([f.end_position for f in features], dtype=torch.long)
     dataset = StrucDataset(all_input_ids, all_input_mask, all_segment_ids,
                             all_xpath_tags_seq, all_xpath_subs_seq,
-                            all_node_spans, all_is_answer_node, all_query_span, all_num_nodes)
+                            all_node_spans, all_is_answer_node, all_intersect_with_answer,
+                            all_query_span, all_num_nodes)
 
     # if output_examples:
     #     dataset = (dataset, examples, features)
@@ -650,7 +648,7 @@ def main():
                                                 output_examples=False)
         tokenizer.save_pretrained(args.output_dir)
         model.to(args.device)
-        global_step, tr_loss = train(args, train_dataset, model, tokenizer)
+        global_step, tr_loss = train(args, train_dataset, model, tokenizer, max_depth)
         logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
 
     # Save the trained model and the tokenizer
