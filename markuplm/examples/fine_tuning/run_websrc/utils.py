@@ -81,6 +81,7 @@ class SRCExample(object):
                  node_spans=None,
                  answer_node=None,
                  intersect_with_answer=None,
+                 node_levels=None,
                  ):
         self.doc_tokens = doc_tokens
         self.qas_id = qas_id
@@ -99,6 +100,7 @@ class SRCExample(object):
         self.node_spans = node_spans
         self.answer_node = answer_node
         self.intersect_with_answer = intersect_with_answer
+        self.node_levels = node_levels
 
     def __str__(self):
         return self.__repr__()
@@ -187,6 +189,7 @@ class InputFeatures(object):
                  is_answer_node=None,
                  intersect_with_answer=None,
                  query_span=None,
+                 node_levels=None,    # 从answer node开始向上数，ans node == 0, others == -1
                  ):
         self.unique_id = unique_id
         self.example_index = example_index
@@ -209,6 +212,7 @@ class InputFeatures(object):
         self.is_answer_node = is_answer_node
         self.intersect_with_answer = intersect_with_answer
         self.query_span = query_span
+        self.node_levels = node_levels
 
 
 def html_escape(html):
@@ -488,6 +492,7 @@ def read_squad_examples(input_file, root_dir, is_training, tokenizer, simplify=F
                         orig_answer_text = None
                         answer_node = None    # tid of answer node
                         intersect_with_answer = set([])   # tid of node which intersect with answer
+                        node_levels = []    # tid: level
 
                         if is_training:
                             if len(qa["answers"]) != 1:
@@ -522,26 +527,23 @@ def read_squad_examples(input_file, root_dir, is_training, tokenizer, simplify=F
                                 logger.warning("Could not find answer of question %s: '%s' vs. '%s'",
                                                qa['id'], actual_text, cleaned_answer_text)
                                 continue
-                            # print ("html_fn:", html_fn)
-                            # print ("doc_tokens:", doc_tokens)
-                            # print ("all_doc_tokens:", all_doc_tokens)
-                            # print ("orig_answer_text:", orig_answer_text)
-                            # print ("answer_length:", answer_length)
-                            # print ("start_position:", start_position)
-                            # print ("end_position:", end_position)
-                            # print ()
-                            # print ()
+
                             _id = answer_node
+                            _level = 0
                             while _id != -1:
                                 intersect_with_answer.add(_id)
+                                node_levels.append(_level)
+                                _level += 1
                                 _id = father_tid_list[_id]
                             for _id in range(len(father_tid_list)):
-                                while _id != -1:
-                                    if _id == answer_node:
+                                if _id in intersect_with_answer:
+                                    continue
+                                tmp = _id
+                                while tmp != -1:
+                                    if tmp == answer_node:
                                         intersect_with_answer.add(_id)
                                         break
-                                    _id = father_tid_list[_id]
-
+                                    tmp = father_tid_list[tmp]
 
                         example = SRCExample(
                             doc_tokens=doc_tokens,
@@ -561,6 +563,7 @@ def read_squad_examples(input_file, root_dir, is_training, tokenizer, simplify=F
                             node_spans = s_spans,
                             answer_node = answer_node,
                             intersect_with_answer = intersect_with_answer,
+                            node_levels = node_levels,
                         )
 
                         examples.append(example)
@@ -627,9 +630,11 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length, doc_stride
         node_spans = []
         is_answer_node = []
         intersect_with_answer = []
+        # node_levels = []
         for tid in example.node_spans:
             s = example.node_spans[tid]
             if s[0] >= s[1]:
+                # node 没有文本内容
                 continue
             node_spans.append((s[0] + 2 + len(query_tokens), s[1] + 2 + len(query_tokens)))
             assert s[1] + 2 + len(query_tokens) < max_seq_length
@@ -638,6 +643,7 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length, doc_stride
             else:
                 is_answer_node.append(0)
             intersect_with_answer.append(1 if tid in example.intersect_with_answer else 0)
+
         assert len(node_spans) == len(is_answer_node)
         assert len(node_spans) == len(intersect_with_answer)
 
@@ -672,6 +678,7 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length, doc_stride
                 break
             start_offset += min(length, doc_stride)
         
+        assert len(doc_spans) == 1
 
         for (doc_span_index, doc_span) in enumerate(doc_spans):
             tokens = []
@@ -780,6 +787,7 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length, doc_stride
                     is_answer_node=is_answer_node,
                     intersect_with_answer=intersect_with_answer,
                     query_span=query_span,
+                    node_levels=example.node_levels,
                 ))
             unique_id += 1
 

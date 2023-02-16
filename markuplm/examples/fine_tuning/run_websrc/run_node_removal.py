@@ -8,7 +8,6 @@ import os
 import random
 import glob
 import timeit
-import copy
 
 import numpy as np
 import torch
@@ -22,7 +21,7 @@ from transformers import (
     get_linear_schedule_with_warmup,
 )
 
-from markuplmft.models.markuplm import MarkupLMConfig, MarkupLMTokenizer, MarkupLMTokenizerFast, MarkupLMForNodeClassification
+from markuplmft.models.markuplm import MarkupLMConfig, MarkupLMTokenizer, MarkupLMTokenizerFast, MarkupLMForQuestionAnswering_true_removal
 
 from utils import StrucDataset
 from utils import (read_squad_examples, convert_examples_to_features, RawResult, write_predictions)
@@ -30,9 +29,7 @@ from utils_evaluate import EvalOpts, main as evaluate_on_squad
 
 # from matplotlib import pyplot as plt
 
-
 logger = logging.getLogger(__name__)
-np.set_printoptions(precision=3)
 
 
 def set_seed(args):
@@ -53,7 +50,7 @@ def to_list(tensor):
     return tensor.detach().cpu().tolist()
 
 
-def train(args, train_dataset, model, tokenizer, max_depth):
+def train(args, train_dataset, model, tokenizer):
     r"""
     Train the model
     """
@@ -120,33 +117,46 @@ def train(args, train_dataset, model, tokenizer, max_depth):
         if isinstance(train_dataloader, DataLoader) and isinstance(train_dataloader.sampler, DistributedSampler):
             train_dataloader.sampler.set_epoch(epoch)
         # epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
-        # for step, batch in enumerate(epoch_iterator):
         for step, batch in enumerate(train_dataloader):
             model.train()
             batch = tuple(t.to(args.device) for t in batch)
+            # 构造移除后的attention mask: batch * length
+            att_mask_removed = batch[1].clone().detach()
+            for i in range(batch[0].size(0)):
+                # node_spans = batch[7][i]  # max_num_nodes * 2，这里全部都是negative nodes
+                num_nodes = batch[8][i].item()
+                # 随机选择num_removed_nodes个节点删除
+                try:
+                    removed_nodes = np.random.choice(num_nodes, args.num_removed_nodes, replace=False)
+                except ValueError:
+                    removed_nodes = np.random.choice(num_nodes, args.num_removed_nodes, replace=True)
+                for j in removed_nodes:
+                    att_mask_removed[i, batch[7][i,j,0].item():batch[7][i,j,1].item()] = 0
+                assert att_mask_removed[i, batch[5][i].item()].item() == 1
+                assert att_mask_removed[i, batch[6][i].item()].item() == 1
+            # print (batch[1], att_mask_removed)
+            # 
             inputs = {'input_ids': batch[0],
-                      'attention_mask': batch[1],
+                      'attention_mask_1': batch[1],
+                      'attention_mask_2': att_mask_removed,
                       'token_type_ids': batch[2],
                       'xpath_tags_seq': batch[3],
                       'xpath_subs_seq': batch[4],
-                      'node_spans': batch[7],
-                      'node_labels': batch[9],
-                      'query_span': batch[10],
-                      'num_nodes': batch[11],
-                      'max_num_nodes': args.max_num_nodes,
+                      'start_positions': batch[5],
+                      'end_positions': batch[6],
                       }
 
             outputs = model(**inputs)
-            loss_per_layer = outputs[1].mean(dim=0)    # [gpus * num_layers] -> [num_layers]
-            loss = loss_per_layer.mean()
+            loss = outputs[0]  # model outputs are always tuple in transformers (see doc)
 
-            if step % 15 == 0:
-                print ("epoch:", epoch, "step:", step, "loss per layer:", loss_per_layer.detach().cpu().numpy(), "total loss:", round(loss.item(), 5))
-                print ()
+            if args.n_gpu > 1:
+                loss = loss.mean()  # mean() to average on multi-gpu parallel (not distributed) training
+
+            if step % 20 == 0:
+                print ("epoch:", epoch, "step:", step, "loss:", round(loss.item(), 5))
+                # print ()
                 sys.stdout.flush()
-
-            # if args.n_gpu > 1:
-            #     loss = loss.mean()  # mean() to average on multi-gpu parallel (not distributed) training
+            
             if args.gradient_accumulation_steps > 1:
                 loss = loss / args.gradient_accumulation_steps
 
@@ -188,13 +198,12 @@ def train(args, train_dataset, model, tokenizer, max_depth):
                     model_to_save.save_pretrained(output_dir)
                     torch.save(args, os.path.join(output_dir, 'training_args.bin'))
                     logger.info("Saving model checkpoint to %s", output_dir)
-            
-            del batch, inputs, outputs, loss_per_layer, loss
-            
+
+            del batch, inputs, outputs, loss
+
             if 0 < args.max_steps < global_step:
                 # epoch_iterator.close()
                 break
-
         if 0 < args.max_steps < global_step:
             train_iterator.close()
             break
@@ -205,15 +214,21 @@ def train(args, train_dataset, model, tokenizer, max_depth):
     return global_step, tr_loss / global_step
 
 
-def evaluate(args, eval_dataset, model, tokenizer, max_depth, prefix=""):
+def evaluate(args, model, tokenizer, max_depth, prefix=""):
+    r"""
+    Evaluate the model
+    """
+    dataset, examples, features = load_and_cache_examples(args, tokenizer, max_depth=max_depth, evaluate=True,
+                                                          output_examples=True)
 
     if not os.path.exists(args.output_dir) and args.local_rank in [-1, 0]:
         os.makedirs(args.output_dir)
 
     args.eval_batch_size = args.per_gpu_eval_batch_size * max(1, args.n_gpu)
     # Note that DistributedSampler samples randomly
-    eval_sampler = SequentialSampler(eval_dataset) if args.local_rank == -1 else DistributedSampler(eval_dataset)
-    eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size, num_workers=args.dataloader_workers)
+    eval_sampler = SequentialSampler(dataset) if args.local_rank == -1 else DistributedSampler(dataset)
+    eval_dataloader = DataLoader(dataset, sampler=eval_sampler, batch_size=args.eval_batch_size
+                                 , num_workers=args.dataloader_workers)
 
     # multi-gpu evaluate
     if args.n_gpu > 1 and not isinstance(model, torch.nn.DataParallel):
@@ -221,152 +236,61 @@ def evaluate(args, eval_dataset, model, tokenizer, max_depth, prefix=""):
 
     # Eval!
     logger.info("***** Running evaluation {} *****".format(prefix))
-    logger.info("  Num examples = %d", len(eval_dataset))
+    logger.info("  Num examples = %d", len(dataset))
     logger.info("  Batch size = %d", args.eval_batch_size)
-    # list of list: cases * layers
-    precisions = []
-    recalls = []
-    # for batch in tqdm(eval_dataloader, desc="Evaluating"):
-    for batch in eval_dataloader:
+    all_results = []
+    start_time = timeit.default_timer()
+    for batch in tqdm(eval_dataloader, desc="Evaluating"):
         model.eval()
         batch = tuple(t.to(args.device) for t in batch)
         with torch.no_grad():
             inputs = {'input_ids': batch[0],
                       'attention_mask': batch[1],
                       'token_type_ids': batch[2],
-                      'xpath_tags_seq': batch[3],
-                      'xpath_subs_seq': batch[4],
-                      'node_spans': batch[7],
-                      'node_labels': batch[9],
-                      'query_span': batch[10],
-                      'num_nodes': batch[11],
-                      'max_num_nodes': args.max_num_nodes,
+                      'xpath_tags_seq': batch[4],
+                      'xpath_subs_seq': batch[5],
                       }
-
+            feature_indices = batch[3]
             outputs = model(**inputs)
-            logits = outputs[0].detach().cpu().numpy()    # [bs*layers*max_num_nodes*num_labels]
-            # logit[i] > 0 -> pred = i: [bs*layers*max_num_nodes]
-            # preds: [bs*layers*max_num_nodes], 
-            # preds = (logits[:,:,:,1] > 0).long().detach().cpu().numpy()
-            labels = batch[9].cpu().numpy()    # [bs * max_num_nodes]
-            num_nodes = batch[11].cpu().numpy()    # [bs]
-            del outputs
-        # 计算每个page上的precision & recall
-        for page_logits, page_labels, page_num_nodes in zip(logits, labels, num_nodes):
-            # page_preds: [layers*max_num_nodes*num_labels]
-            # page_labels: [max_num_nodes]
-            page_logits = page_logits[:,:page_num_nodes,1]    # [layers*num_nodes]
-            page_labels = page_labels[:page_num_nodes].astype(bool)        # [num_nodes]
-            # nodes whose scores in top k are positive, others are negative 
-            # preds = page_logits.argsort(axis=1)[:, -args.k:]     # 最大的k个节点的index: [layers * k]
-            # >0 -> pos ; <0 -> neg
-            page_preds = (page_logits >= 0)
-            tmp = (page_preds & page_labels).sum(axis=1)
-            page_precision = tmp / page_preds.sum(axis=1)
-            page_precision[np.isnan(page_precision)] = 0
-            page_recall = tmp / page_labels.sum()
-            precisions.append(page_precision)
-            recalls.append(page_recall)
 
-    # [cases * layers]
-    precisions = np.array(precisions)
-    recalls = np.array(recalls)
+        for i, feature_index in enumerate(feature_indices):
+            eval_feature = features[feature_index.item()]
+            unique_id = int(eval_feature.unique_id)
+            result = RawResult(unique_id=unique_id,
+                               start_logits=to_list(outputs[0][i]),
+                               end_logits=to_list(outputs[1][i]))
+            all_results.append(result)
 
-    print ("Precision:", precisions.mean(0))
-    print ("Recall:", recalls.mean(0))
+    eval_time = timeit.default_timer() - start_time
+    logger.info("  Evaluation done in total %f secs (%f sec per example)", eval_time, eval_time / len(dataset))
 
+    # Compute predictions
+    output_prediction_file = os.path.join(args.output_dir, "predictions_{}.json".format(prefix))
+    output_tag_prediction_file = os.path.join(args.output_dir, "tag_predictions_{}.json".format(prefix))
+    output_nbest_file = os.path.join(args.output_dir, "nbest_predictions_{}.json".format(prefix))
+    output_result_file = os.path.join(args.output_dir, "qas_eval_results_{}.json".format(prefix))
+    output_file = os.path.join(args.output_dir, "eval_matrix_results_{}".format(prefix))
 
+    write_predictions(examples, features, all_results, args.n_best_size, args.max_answer_length, args.do_lower_case,
+                      output_prediction_file, output_tag_prediction_file, output_nbest_file, args.verbose_logging,
+                      tokenizer)
 
-def evaluate2(args, eval_dataset, model, tokenizer, max_depth, prefix=""):
-    # 按照true node到ans node的距离，即node level，来统计recall
-
-    if not os.path.exists(args.output_dir) and args.local_rank in [-1, 0]:
-        os.makedirs(args.output_dir)
-
-    args.eval_batch_size = args.per_gpu_eval_batch_size * max(1, args.n_gpu)
-    # Note that DistributedSampler samples randomly
-    eval_sampler = SequentialSampler(eval_dataset) if args.local_rank == -1 else DistributedSampler(eval_dataset)
-    eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size, num_workers=args.dataloader_workers)
-
-    # multi-gpu evaluate
-    if args.n_gpu > 1 and not isinstance(model, torch.nn.DataParallel):
-        model = torch.nn.DataParallel(model)
-
-    # Eval!
-    logger.info("***** Running evaluation {} *****".format(prefix))
-    logger.info("  Num examples = %d", len(eval_dataset))
-    logger.info("  Batch size = %d", args.eval_batch_size)
-    # list of list: cases * levels (begining from 0)
-    recalls = []
-    # for batch in tqdm(eval_dataloader, desc="Evaluating"):
-    for batch in eval_dataloader:
-        model.eval()
-        batch = tuple(t.to(args.device) for t in batch)
-        with torch.no_grad():
-            inputs = {'input_ids': batch[0],
-                      'attention_mask': batch[1],
-                      'token_type_ids': batch[2],
-                      'xpath_tags_seq': batch[3],
-                      'xpath_subs_seq': batch[4],
-                      'node_spans': batch[7],
-                      'node_labels': batch[9],
-                      'query_span': batch[10],
-                      'num_nodes': batch[11],
-                      'max_num_nodes': args.max_num_nodes,
-                      }
-
-            outputs = model(**inputs)
-            logits = outputs[0].detach().cpu().numpy()    # [bs*layers*max_num_nodes*num_labels]
-            # logit[i] > 0 -> pred = i: [bs*layers*max_num_nodes]
-            labels = batch[9].cpu().numpy()    # [bs * max_num_nodes]
-            num_nodes = batch[11].cpu().numpy()    # [bs]
-            node_levels = batch[12].cpu().numpy()   # bs * max_num_nodes
-            del outputs
-        # 计算每个page上的precision & recall
-        for page_logits, page_labels, page_num_nodes, page_node_levels in zip(logits, labels, num_nodes, node_levels):
-            # page_preds: [layers*max_num_nodes*num_labels]
-            # page_labels: [max_num_nodes]
-            page_logits = page_logits[5,:page_num_nodes,1]    # [num_nodes]   这里希望测量第六层的分类性能
-            page_labels = page_labels[:page_num_nodes].astype(bool)        # [num_nodes]
-            page_node_levels = page_node_levels[:page_num_nodes]   # [num_nodes]
-            # >0 -> pos ; <0 -> neg
-            page_preds = (page_logits >= 0)
-            tmp = []
-            for l in range(16):
-                if page_node_levels[l] < 0:
-                    break
-                else:
-                    if page_preds[page_node_levels[l]]:
-                        tmp.append(1)
-                    else:
-                        tmp.append(0)
-            recalls.append(tmp)
-    # print (recalls)
-    # [levels]
-    r = []
-    for l in range(8):
-        c1, c2 = 0, 0
-        for res in recalls:
-            try:
-                if res[l]:
-                    c1 += 1
-                c2 += 1
-            except:
-                pass
-        if c2 > 0:
-            r.append(1. * c1 / c2)
-        else:
-            r.append(np.nan)
-
-    print (r)
-
-
+    # Evaluate
+    evaluate_options = EvalOpts(data_file=args.predict_file,
+                                root_dir=args.root_dir,
+                                pred_file=output_prediction_file,
+                                tag_pred_file=output_tag_prediction_file,
+                                result_file=output_result_file,
+                                out_file=output_file)
+    results = evaluate_on_squad(evaluate_options)
+    return results
 
 
 def load_and_cache_examples(args, tokenizer, max_depth=50, evaluate=False, output_examples=False):
     r"""
     Load and process the raw data.
     """
+    output_examples = False    # 让output_examples永远为false
     if args.local_rank not in [-1, 0] and not evaluate:
         torch.distributed.barrier()  # Make sure only the first process in distributed training process the dataset,
         # and the others will use the cache
@@ -407,6 +331,7 @@ def load_and_cache_examples(args, tokenizer, max_depth=50, evaluate=False, outpu
                                        simplify=False,
                                        max_depth=max_depth)
 
+
         features = convert_examples_to_features(examples=examples,
                                                 tokenizer=tokenizer,
                                                 max_seq_length=args.max_seq_length,
@@ -440,88 +365,58 @@ def load_and_cache_examples(args, tokenizer, max_depth=50, evaluate=False, outpu
     all_start_positions = torch.tensor([f.start_position for f in features], dtype=torch.long)
     all_end_positions = torch.tensor([f.end_position for f in features], dtype=torch.long)
 
+    # 训练模式：如果node数量超过batch size，则随机选取batch size（保证尽量选择negative nodes）
     all_node_spans = []
-    all_is_answer_node = []
-    all_intersect_with_answer = []
+    # all_is_answer_node = []
+    # all_intersect_with_answer = []
     all_query_span = []
     all_num_nodes = []
-    all_node_levels = []
     for f in features:
-        node_spans, is_answer_node, intersect_with_answer, node_levels = f.node_spans, f.is_answer_node, f.intersect_with_answer, f.node_levels
+        node_spans, intersect_with_answer = f.node_spans, f.intersect_with_answer
         node_num = len(node_spans)
-        assert node_num == len(is_answer_node)
-        assert node_num == len(intersect_with_answer)
-        # assert node_num == len(node_levels)
+        # assert node_num == len(is_answer_node)
+        # assert node_num == len(intersect_with_answer)
         # 构造训练用的node_spans & labels
         _node_spans = []
-        _is_answer_node = []
-        _intersect_with_answer = []
-        # _node_levels = []
-        neg_ids = list(range(node_num))
+        # _is_answer_node = []
+        # _intersect_with_answer = []
         cnt = 0
-        # 先选择positive加入到training data
+        # 只选择negative加入到node spans
         for i in range(node_num):
             if cnt >= args.max_num_nodes:
                 break
-            if intersect_with_answer[i]:
+            if not intersect_with_answer[i]:
                 _node_spans.append(node_spans[i])
-                _is_answer_node.append(is_answer_node[i])
-                _intersect_with_answer.append(intersect_with_answer[i])
-                # _node_levels.append(node_levels[i])
-                neg_ids.remove(i)
+                # _is_answer_node.append(is_answer_node[i])
+                # _intersect_with_answer.append(intersect_with_answer[i])
                 cnt += 1
-        # 再选择negative加入
-        random.shuffle(neg_ids)
-        for i in neg_ids:
-            if cnt >= args.max_num_nodes:
-                break
-            _node_spans.append(node_spans[i])
-            _is_answer_node.append(is_answer_node[i])
-            _intersect_with_answer.append(intersect_with_answer[i])
-            # _node_levels.append(node_levels[i])
-            cnt += 1
         # 最后padding
-        while cnt < args.max_num_nodes:
+        while cnt <= args.max_num_nodes:
             _node_spans.append(node_spans[-1])
-            _is_answer_node.append(-100)
-            _intersect_with_answer.append(-100)
-            # _node_levels.append(-1)
+            # _is_answer_node.append(-100)
+            # _intersect_with_answer.append(-100)
             cnt += 1
         # 添加到全体
         all_node_spans.append(_node_spans)
-        all_is_answer_node.append(_is_answer_node)
-        all_intersect_with_answer.append(_intersect_with_answer)
-        all_query_span.append(f.query_span)
+        # all_is_answer_node.append(_is_answer_node)
+        # all_intersect_with_answer.append(_intersect_with_answer)
+        # all_query_span.append(f.query_span)
         all_num_nodes.append(min(node_num, args.max_num_nodes))
-        all_node_levels.append(node_levels[:16] if len(node_levels)>=16 else node_levels+[-1]*(16-len(node_levels)))
     
-    all_query_span = torch.tensor(all_query_span, dtype=torch.long)
+    # all_query_span = torch.tensor(all_query_span, dtype=torch.long)
     all_node_spans = torch.tensor(all_node_spans, dtype=torch.long)
-    all_is_answer_node = torch.tensor(all_is_answer_node, dtype=torch.long)
-    all_intersect_with_answer = torch.tensor(all_intersect_with_answer, dtype=torch.long)
     all_num_nodes = torch.tensor(all_num_nodes, dtype=torch.long)
-    all_node_levels = torch.tensor(all_node_levels, dtype=torch.long)
+
 
     dataset = StrucDataset(all_input_ids, all_input_mask, all_segment_ids,
                            all_xpath_tags_seq, all_xpath_subs_seq,
                            all_start_positions, all_end_positions,
-                           all_node_spans, all_is_answer_node, all_intersect_with_answer,
-                           all_query_span, all_num_nodes, all_node_levels)
-
-    # if output_examples:
-    #     dataset = (dataset, examples, features)
+                           all_node_spans, all_num_nodes)
     
     return dataset
 
-def is_integer(x:str):
-    try:
-        int(x)
-        return True
-    except:
-        return False
 
-
-def main():
+def parse():
     parser = argparse.ArgumentParser()
 
     # Required parameters
@@ -577,7 +472,7 @@ def main():
                         help="Only evaluate the checkpoints with prefix smaller than it, beside the final checkpoint "
                              "with no prefix")
     
-    parser.add_argument("--dataloader_workers", default=16, type=int,
+    parser.add_argument("--dataloader_workers", default=8, type=int,
                         help="Number of dataloader worker for evaluation.")
     parser.add_argument("--per_gpu_train_batch_size", default=8, type=int,
                         help="Batch size per GPU/CPU for training.")
@@ -627,9 +522,15 @@ def main():
                              "See details at https://nvidia.github.io/apex/amp.html")
     parser.add_argument('--server_ip', type=str, default='', help="Can be used for distant debugging.")
     parser.add_argument('--server_port', type=str, default='', help="Can be used for distant debugging.")
-    parser.add_argument('--max_num_nodes', type=int, default=16, help="The number of node spans per case during training.")
-    # parser.add_argument('--k', type=int, default=5, help="Recall @ k.")
+    parser.add_argument('--max_num_nodes', type=int, default=92, help="The number of node spans per case during training.")
+    parser.add_argument('--num_removed_nodes', type=int, default=92, help="The number of removed node spans per case during training.")
     args = parser.parse_args()
+
+    return args
+
+
+def main():
+    args = parse()
 
     if os.path.exists(args.output_dir) and os.listdir(
             args.output_dir) and args.do_train and not args.overwrite_output_dir:
@@ -664,12 +565,11 @@ def main():
         # Make sure only the first process in distributed training will download model & vocab
 
     config = MarkupLMConfig.from_pretrained(args.model_name_or_path)
-    config.num_labels = 2
     logger.info("=====Config for model=====")
     logger.info(str(config))
     max_depth = config.max_depth
     tokenizer = MarkupLMTokenizer.from_pretrained(args.model_name_or_path)
-    model = MarkupLMForNodeClassification.from_pretrained(args.model_name_or_path, config=config)
+    model = MarkupLMForQuestionAnswering_true_removal.from_pretrained(args.model_name_or_path, config=config)
 
     if args.local_rank == 0:
         torch.distributed.barrier()
@@ -695,7 +595,7 @@ def main():
                                                 output_examples=False)
         tokenizer.save_pretrained(args.output_dir)
         model.to(args.device)
-        global_step, tr_loss = train(args, train_dataset, model, tokenizer, max_depth)
+        global_step, tr_loss = train(args, train_dataset, model, tokenizer)
         logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
 
     # Save the trained model and the tokenizer
@@ -714,24 +614,17 @@ def main():
         torch.save(args, os.path.join(args.output_dir, 'training_args.bin'))
 
     # Evaluation - we can ask to evaluate all the checkpoints (sub-directories) in a directory
-    # results = {}
+    results = {}
     if args.do_eval and args.local_rank in [-1, 0]:
-        # 
         checkpoints = [args.output_dir]
         if args.eval_all_checkpoints:
             checkpoints = list(
                 os.path.dirname(c) for c in sorted(glob.glob(args.output_dir + '/**/' + WEIGHTS_NAME, recursive=True)))
-            # 排个序
-            checkpoints = filter(lambda p: re.match(r'checkpoint-\d+', os.path.basename(p)), checkpoints)
-            checkpoints = sorted(checkpoints, key=lambda x: int(x.split('-')[-1]))
             logging.getLogger("transformers.modeling_utils").setLevel(logging.WARN)  # Reduce model loading logs
 
         logger.info("Evaluate the following checkpoints: %s", checkpoints)
         # config = MarkupLMConfig.from_pretrained(args.output_dir)
-        tokenizer = MarkupLMTokenizer.from_pretrained(args.output_dir)
-
-        # load eval dataset
-        eval_dataset = load_and_cache_examples(args, tokenizer, max_depth=max_depth, evaluate=True, output_examples=False)
+        # tokenizer = MarkupLMTokenizer.from_pretrained(args.output_dir)
 
         for checkpoint in checkpoints:
             # Reload the model
@@ -744,21 +637,19 @@ def main():
                 continue
             if global_step and args.eval_to_checkpoint is not None and int(global_step) >= args.eval_to_checkpoint:
                 continue
-            model = MarkupLMForNodeClassification.from_pretrained(checkpoint, config=config)
+            model = MarkupLMForQuestionAnswering_true_removal.from_pretrained(checkpoint, config=config)
             model.to(args.device)
 
             # Evaluate
-            evaluate2(args, eval_dataset, model, tokenizer, max_depth=max_depth, prefix=global_step)
-            # result = evaluate(args, model, tokenizer, max_depth=max_depth, prefix=global_step)
+            result = evaluate(args, model, tokenizer, max_depth=max_depth, prefix=global_step)
 
-            # result = dict((k + ('_{}'.format(global_step) if global_step else ''), v) for k, v in result.items())
-            # results.update(result)
+            result = dict((k + ('_{}'.format(global_step) if global_step else ''), v) for k, v in result.items())
+            results.update(result)
 
-    # logger.info("Results: {}".format(results))
+    logger.info("Results: {}".format(results))
 
-    # return results
+    return results
 
 
 if __name__ == "__main__":
     main()
-
