@@ -622,7 +622,7 @@ def main():
                 os.path.dirname(c) for c in sorted(glob.glob(args.output_dir + '/**/' + WEIGHTS_NAME, recursive=True)))
             # 排个序
             checkpoints = filter(lambda p: re.match(r'checkpoint-\d+', os.path.basename(p)), checkpoints)
-            checkpoints = sorted(checkpoints, key=lambda x: int(x.split('-')[-1]))[54:]
+            checkpoints = sorted(checkpoints, key=lambda x: int(x.split('-')[-1]))
             logging.getLogger("transformers.modeling_utils").setLevel(logging.WARN)  # Reduce model loading logs
 
         logger.info("Evaluate the following checkpoints: %s", checkpoints)

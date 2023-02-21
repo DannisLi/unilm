@@ -1,12 +1,12 @@
-CUDA_VISIBLE_DEVICES=4,5,6,7 python run_true_removal.py \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python run_true_removal.py \
 	--predict_file /home/v-lizimeng/data/WebSRC/websrc1.0_dev_.json \
 	--root_dir /home/v-lizimeng/data/WebSRC \
 	--model_name_or_path microsoft/markuplm-base \
-	--output_dir /home/v-lizimeng/unilm/markuplm/examples/fine_tuning/run_websrc/results_true_removal_16 \
+	--output_dir /home/v-lizimeng/unilm/markuplm/examples/fine_tuning/run_websrc/results_true_removal_25 \
 	--do_eval \
 	--eval_all_checkpoints \
 	--max_query_length 42 \
 	--max_seq_length 512 \
-	--per_gpu_eval_batch_size 82 \
+	--per_gpu_eval_batch_size 84 \
 	--max_num_nodes 92 \
-	--num_removed_nodes 16
+	--num_removed_nodes 25

@@ -1396,13 +1396,13 @@ class MarkupLMForQuestionAnswering_node_removal(MarkupLMPreTrainedModel):
         self.markuplm = MarkupLMModel(config, add_pooling_layer=False)
         # node removal module
         self.node_removal_layer = nn.Sequential(
-            nn.Dropout(0.1),
+            # nn.Dropout(0.1),
             nn.Linear(config.hidden_size*2, config.hidden_size),
-            nn.Dropout(0.1),
+            # nn.Dropout(0.1),
             nn.GELU(),
-            nn.Linear(config.hidden_size, config.hidden_size),
-            nn.Dropout(0.1),
-            nn.GELU(),
+            # nn.Linear(config.hidden_size, config.hidden_size),
+            # nn.Dropout(0.1),
+            # nn.GELU(),
             nn.Linear(config.hidden_size, 1),
         )
         # qa output
@@ -1493,7 +1493,7 @@ class MarkupLMForQuestionAnswering_node_removal(MarkupLMPreTrainedModel):
             query_rep.append(query_rep_case)
             # 当前case的节点数和spans
             # num_nodes_case = num_nodes[b].item()
-            node_spans_case = node_spans[b, :num_nodes_case]    # [num_nodes * 2]
+            node_spans_case = node_spans[b]    # [num_nodes * 2]
             # 当前case的所有nodes的embedings: [num_nodes * dim]
             node_reps_case = torch.stack([hidden_states[b, sp[0]:sp[1]].mean(dim=0) for sp in node_spans[b]], dim=0)
             # print (max_num_nodes, node_reps_case.shape)

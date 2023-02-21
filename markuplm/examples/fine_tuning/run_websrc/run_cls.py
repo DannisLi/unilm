@@ -257,8 +257,7 @@ def evaluate(args, eval_dataset, model, tokenizer, max_depth, prefix=""):
             # page_labels: [max_num_nodes]
             page_logits = page_logits[:,:page_num_nodes,1]    # [layers*num_nodes]
             page_labels = page_labels[:page_num_nodes].astype(bool)        # [num_nodes]
-            # nodes whose scores in top k are positive, others are negative 
-            # preds = page_logits.argsort(axis=1)[:, -args.k:]     # 最大的k个节点的index: [layers * k]
+            # nodes whose scores in top k are positive, others are negative
             # >0 -> pos ; <0 -> neg
             page_preds = (page_logits >= 0)
             tmp = (page_preds & page_labels).sum(axis=1)

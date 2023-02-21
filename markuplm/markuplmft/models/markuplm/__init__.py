@@ -46,6 +46,7 @@ if is_torch_available():
         "MarkupLMModel",
         "MarkupLMForNodeClassification",
         "MarkupLMForQuestionAnswering_true_removal",
+        "MarkupLMForQuestionAnswering_node_removal",
     ]
 
 if TYPE_CHECKING:
@@ -63,6 +64,7 @@ if TYPE_CHECKING:
             MarkupLMModel,
             MarkupLMForNodeClassification,
             MarkupLMForQuestionAnswering_true_removal,
+            MarkupLMForQuestionAnswering_node_removal,
         )
 
 else:
