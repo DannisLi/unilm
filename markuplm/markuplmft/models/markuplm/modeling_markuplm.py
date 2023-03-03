@@ -20,7 +20,7 @@ import os
 import torch
 import torch.utils.checkpoint
 from torch import nn
-from torch.nn import CrossEntropyLoss
+from torch.nn import CrossEntropyLoss, BCEWithLogitsLoss
 import torch.nn.functional as F
 
 from transformers.activations import ACT2FN
@@ -1151,7 +1151,7 @@ class MarkupLMForNodeClassification(MarkupLMPreTrainedModel):
 
         self.markuplm = MarkupLMModel(config, add_pooling_layer=False)
         self.classifiers = nn.ModuleList([self.build_classifier(config) for _ in range(config.num_hidden_layers+1)])
-        self.register_buffer("class_weight", torch.tensor([1., 20.]))
+        self.register_buffer("class_weight", torch.tensor([1., 30.]))
         self.loss_fct = CrossEntropyLoss(weight=self.class_weight, ignore_index=-100)
 
         self.init_weights()
@@ -1159,12 +1159,12 @@ class MarkupLMForNodeClassification(MarkupLMPreTrainedModel):
 
     def build_classifier(self, config):
         return nn.Sequential(
-            nn.Dropout(0.1),
+            nn.Dropout(0.2),
             nn.Linear(config.hidden_size*2, config.hidden_size),
-            nn.Dropout(0.1),
+            nn.Dropout(0.2),
             nn.GELU(),
             nn.Linear(config.hidden_size, config.hidden_size),
-            nn.Dropout(0.1),
+            nn.Dropout(0.2),
             nn.GELU(),
             nn.Linear(config.hidden_size, config.num_labels),
         )
@@ -1182,11 +1182,10 @@ class MarkupLMForNodeClassification(MarkupLMPreTrainedModel):
             node_labels=None,
             query_span=None,
             output_attentions=None,
-            # output_hidden_states=None,
             return_dict=None,
             xpath_tags_seq=None,
             xpath_subs_seq=None,
-            max_num_nodes = 128,
+            max_num_nodes=128,
         ):
         '''
         num_nodes[bs]: the number of DOM nodes
@@ -1387,7 +1386,7 @@ class MarkupLMForQuestionAnswering_true_removal(MarkupLMPreTrainedModel):
         else:
             return start_logits, end_logits
 
-
+'''
 class MarkupLMForQuestionAnswering_node_removal(MarkupLMPreTrainedModel):
 
     def __init__(self, config):
@@ -1557,3 +1556,196 @@ class MarkupLMForQuestionAnswering_node_removal(MarkupLMPreTrainedModel):
             return  total_loss, start_logits, end_logits
         else:
             return start_logits, end_logits
+'''
+
+class MarkupLMForQuestionAnswering_node_removal(MarkupLMPreTrainedModel):
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.config = config
+        self.markuplm = MarkupLMModel(config, add_pooling_layer=False)
+        # auxiliuary classifier
+        self.intersect_with_answer_classifier = nn.Sequential(
+            nn.Dropout(0.2),
+            nn.Linear(config.hidden_size*2, config.hidden_size),
+            nn.Dropout(0.2),
+            nn.GELU(),
+            nn.Linear(config.hidden_size, config.hidden_size),
+            nn.Dropout(0.2),
+            nn.GELU(),
+            nn.Linear(config.hidden_size, 2),
+        )
+        # node removal module
+        self.node_removal_layer = nn.Sequential(
+            nn.Linear(config.hidden_size*2, config.hidden_size),
+            nn.GELU(),
+            nn.Linear(config.hidden_size, 1),
+        )
+        self.register_buffer("intersect_with_answer_weight", torch.tensor([1., 30.]))
+        self.intersect_with_answer_loss_fct = CrossEntropyLoss(weight=self.intersect_with_answer_weight, ignore_index=-100)
+        # qa output
+        self.qa_outputs = nn.Linear(config.hidden_size, 2)
+        # initialize
+        self.init_weights()
+
+
+    def extend_attention_mask(self, attention_mask):
+        extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+        extended_attention_mask = extended_attention_mask.to(dtype=self.dtype)
+        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
+
+
+    def forward(
+            self,
+            input_ids=None,
+            attention_mask=None,
+            token_type_ids=None,
+            position_ids=None,
+            head_mask=None,
+            inputs_embeds=None,
+            start_positions=None,
+            end_positions=None,
+            return_dict=None,
+            xpath_tags_seq=None,
+            xpath_subs_seq=None,
+            query_span=None,
+            node_spans=None,
+            intersect_with_answer_labels=None,
+    ):
+        '''
+        query_span: [batch_size]
+        node_spans: [batch_size, num_nodes, 2]
+        intersect_with_answer_labels: [batch_size, num_nodes]
+        '''
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if input_ids is not None and inputs_embeds is not None:
+            raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
+        elif input_ids is not None:
+            input_shape = input_ids.size()
+        elif inputs_embeds is not None:
+            input_shape = inputs_embeds.size()[:-1]
+        else:
+            raise ValueError("You have to specify either input_ids or inputs_embeds")
+
+        device = input_ids.device if input_ids is not None else inputs_embeds.device
+
+        if attention_mask is None:
+            attention_mask = torch.ones(input_shape, device=device)
+
+        if token_type_ids is None:
+            token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=device)
+
+        # set head mask
+        if head_mask is not None:
+            if head_mask.dim() == 1:
+                head_mask = head_mask.unsqueeze(0).unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+                head_mask = head_mask.expand(self.config.num_hidden_layers, -1, -1, -1, -1)
+            elif head_mask.dim() == 2:
+                head_mask = head_mask.unsqueeze(1).unsqueeze(-1).unsqueeze(-1)
+            head_mask = head_mask.to(dtype=next(self.parameters()).dtype)
+        else:
+            head_mask = [None] * self.config.num_hidden_layers
+
+        # Build the forward prop
+        # embedding layer
+        hidden_states = self.markuplm.embeddings(
+            input_ids=input_ids,
+            xpath_tags_seq=xpath_tags_seq,
+            xpath_subs_seq=xpath_subs_seq,
+            position_ids=position_ids,
+            token_type_ids=token_type_ids,
+            inputs_embeds=inputs_embeds,
+        )
+        # first six self-attention layers
+        extend_attention_mask = self.extend_attention_mask(attention_mask)
+        for i, layer_module in enumerate(self.markuplm.encoder.layer[:self.config.num_hidden_layers//2]):
+            layer_head_mask = head_mask[i] if head_mask is not None else None
+            layer_outputs = layer_module(
+                hidden_states,
+                attention_mask=extend_attention_mask,
+                head_mask=layer_head_mask,
+            )
+            hidden_states = layer_outputs[0]
+        # node removal
+        batch_size = node_spans.size(0)
+        num_nodes = node_spans.size(1)
+        query_rep = []
+        node_reps = []
+        for b in range(batch_size):
+            # 当前case的query embeddings: [dim]
+            query_rep_case = hidden_states[b, query_span[b,0]:query_span[b,1]].mean(dim=0)
+            query_rep.append(query_rep_case)
+            # 当前case的节点数和spans
+            # num_nodes_case = num_nodes[b].item()
+            node_spans_case = node_spans[b]    # [num_nodes * 2]
+            # 当前case的所有nodes的embedings: [num_nodes * dim]
+            node_reps_case = torch.stack([hidden_states[b, sp[0]:sp[1]].mean(dim=0) for sp in node_spans[b]], dim=0)
+            node_reps.append(node_reps_case)
+        # query_rep: [batch_size * dim] & node_reps: [batch_size * max_num_nodes * dim]
+        query_rep = torch.stack(query_rep, dim=0)
+        node_reps = torch.stack(node_reps, dim=0)
+        # query_node_reps: [batch_size, num_nodes, 2*dim]
+        query_node_reps = torch.cat((query_rep.unsqueeze(1).repeat(1,num_nodes,1), node_reps), dim=-1)
+        # intersect_with_answer_logits: [batch_size, num_nodes, 2]
+        intersect_with_answer_logits = self.intersect_with_answer_classifier(query_node_reps)
+        if intersect_with_answer_labels is not None:
+            intersect_with_answer_loss = self.intersect_with_answer_loss_fct(
+                intersect_with_answer_logits.view(-1, 2), intersect_with_answer_labels.view(-1))
+        intersect_with_answer_nodes = intersect_with_answer_logits[:,:,1] > intersect_with_answer_logits[:,:,0]
+        # node removal layer: bool, [batch_size, num_nodes]
+        removed_nodes = self.node_removal_layer(query_node_reps).squeeze(-1) < 0
+        # make mask
+        removal_mask = torch.ones(input_shape, device=device)
+        # removal_mask = (intersect_with_node_logits[:,:,1] > intersect_with_node_logits[:,:,0]).int()
+        for i in range(batch_size):
+            for j in range(num_nodes):
+                if not intersect_with_answer_nodes[i,j] and removed_nodes[i,j]:
+                    removal_mask[i, node_spans[i,j,0]:node_spans[i,j,1]] = 0
+        attention_mask_after_removal = removal_mask * attention_mask
+        # last six self-attention layers
+        extend_attention_mask = self.extend_attention_mask(attention_mask_after_removal)
+        for i, layer_module in enumerate(self.markuplm.encoder.layer[self.config.num_hidden_layers//2:]):
+            i += self.config.num_hidden_layers//2
+            layer_head_mask = head_mask[i] if head_mask is not None else None
+            layer_outputs = layer_module(
+                hidden_states,
+                attention_mask=extend_attention_mask,
+                head_mask=layer_head_mask,
+            )
+            hidden_states = layer_outputs[0]
+        
+        # QA loss and train
+        logits = self.qa_outputs(hidden_states)
+        start_logits, end_logits = logits.split(1, dim=-1)
+        start_logits = start_logits.squeeze(-1).contiguous()
+        end_logits = end_logits.squeeze(-1).contiguous()
+
+        # 去掉padding和remove的节点
+        tmp = attention_mask_after_removal.bool()
+        start_logits[~tmp] = -1e6
+        end_logits[~tmp] = -1e6
+        del tmp
+
+        total_loss = None
+        if start_positions is not None and end_positions is not None and intersect_with_answer_labels is not None:
+            # If we are on multi-GPU, split add a dimension
+            if len(start_positions.size()) > 1:
+                start_positions = start_positions.squeeze(-1)
+            if len(end_positions.size()) > 1:
+                end_positions = end_positions.squeeze(-1)
+            # sometimes the start/end positions are outside our model inputs, we ignore these terms
+            ignored_index = start_logits.size(1)
+            start_positions.clamp_(0, ignored_index)
+            end_positions.clamp_(0, ignored_index)
+
+            # 排除padding和removal位置的logits
+            loss_fct = CrossEntropyLoss(ignore_index=ignored_index)
+            start_loss = loss_fct(start_logits, start_positions)
+            end_loss = loss_fct(end_logits, end_positions)
+            total_loss = (start_loss + end_loss) / 2 + 0.4 * intersect_with_answer_loss
+        
+            return  total_loss, start_logits, end_logits
+        else:
+            return start_logits, end_logits
+

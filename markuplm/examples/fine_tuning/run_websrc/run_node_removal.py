@@ -11,6 +11,7 @@ import timeit
 import time
 import nevergrad as ng
 from collections import OrderedDict
+import copy
 
 from scipy.optimize import minimize
 import numpy as np
@@ -51,6 +52,9 @@ def set_seed(args):
 
 def to_list(tensor):
     return tensor.detach().cpu().tolist()
+
+
+# def train_node_removal(args, train_dataset, model, tokenizer):
 
 
 def train(args, train_dataset, model, tokenizer):
@@ -100,7 +104,6 @@ def train(args, train_dataset, model, tokenizer):
                                                           output_device=args.local_rank,
                                                           find_unused_parameters=True)
 
-    # print (model.module)
     # Train!
     logger.info("***** Running training *****")
     logger.info("  Num examples = %d", len(train_dataset))
@@ -136,6 +139,7 @@ def train(args, train_dataset, model, tokenizer):
                       'end_positions': batch[6],
                       'node_spans': batch[7],
                       'query_span': batch[10],
+                      'intersect_with_answer_labels': batch[11],
                       }
             
             def node_removal_objective(params):
@@ -151,11 +155,10 @@ def train(args, train_dataset, model, tokenizer):
                     loss = model(**inputs)[0]
                     if args.n_gpu > 1:
                         loss = loss.mean()
-                    
                 return loss.item()
             
             # optmize parameters in node removal layer
-            if step % 40 == 0:
+            if step % 1 == 0:
                 tmp = model.module.node_removal_layer
                 ng_optimizer = ng.optimizers.NGOpt(
                     parametrization = ng.p.Dict(
@@ -163,8 +166,7 @@ def train(args, train_dataset, model, tokenizer):
                         b1 = ng.p.Array(init=tmp[0].bias.detach().cpu().numpy()),
                         w2 = ng.p.Array(init=tmp[2].weight.detach().cpu().numpy()),
                         b2 = ng.p.Array(init=tmp[2].bias.detach().cpu().numpy()),
-                    ),
-                    budget=120,)
+                    ), budget=3)
                 node_removal_params = ng_optimizer.minimize(node_removal_objective).value
                 # load parameters
                 state_dict = OrderedDict()
@@ -273,24 +275,11 @@ def evaluate(args, data, model, tokenizer, max_depth, prefix=""):
         model.eval()
         batch = tuple(t.to(args.device) for t in batch)
         with torch.no_grad():
-            # 构造移除后的attention mask: batch * length
-            att_mask_removed = batch[1].clone().detach()
-            for i in range(batch[0].size(0)):
-                num_nodes = batch[8][i].item()
-                # 随机选择num_removed_nodes个节点删除
-                removed_nodes = np.random.choice(num_nodes, min(num_nodes, args.num_removed_nodes), replace=False)
-                for j in removed_nodes:
-                    att_mask_removed[i, batch[7][i,j,0].item():batch[7][i,j,1].item()] = 0
-                assert att_mask_removed[i, batch[5][i].item()].item()
-                assert att_mask_removed[i, batch[6][i].item()].item()
-            
             inputs = {'input_ids': batch[0],
                       'attention_mask': batch[1],
                       'token_type_ids': batch[2],
                       'xpath_tags_seq': batch[3],
                       'xpath_subs_seq': batch[4],
-                      'start_positions': batch[5],
-                      'end_positions': batch[6],
                       'node_spans': batch[7],
                       'query_span': batch[10],
                       }
@@ -358,7 +347,6 @@ def load_and_cache_examples(args, tokenizer, max_depth=50, evaluate=False, outpu
             examples = read_squad_examples(input_file=input_file,
                                            root_dir=args.root_dir,
                                            is_training=not evaluate,
-                                        #    is_training=True,
                                            tokenizer=tokenizer,
                                            simplify=True,
                                            max_depth=max_depth)
@@ -369,8 +357,7 @@ def load_and_cache_examples(args, tokenizer, max_depth=50, evaluate=False, outpu
 
         examples = read_squad_examples(input_file=input_file,
                                        root_dir=args.root_dir,
-                                    #    is_training=not evaluate,
-                                       is_training=True,
+                                       is_training=not evaluate,
                                        tokenizer=tokenizer,
                                        simplify=False,
                                        max_depth=max_depth)
@@ -381,8 +368,7 @@ def load_and_cache_examples(args, tokenizer, max_depth=50, evaluate=False, outpu
                                                 max_seq_length=args.max_seq_length,
                                                 doc_stride=args.doc_stride,
                                                 max_query_length=args.max_query_length,
-                                                # is_training=not evaluate,
-                                                is_training=True,
+                                                is_training=not evaluate,
                                                 cls_token=tokenizer.cls_token,
                                                 sep_token=tokenizer.sep_token,
                                                 pad_token=tokenizer.pad_token_id,
@@ -411,40 +397,47 @@ def load_and_cache_examples(args, tokenizer, max_depth=50, evaluate=False, outpu
 
     all_query_span = torch.tensor([f.query_span for f in features], dtype=torch.long)
 
-    # 只选择negative nodes
+    # construct node spans
     all_node_spans = []
-    all_num_nodes = []
+    all_num_nodes = []    # how many valid nodes of each page
+    all_intersect_with_answer = []
     for f in features:
         node_spans, intersect_with_answer = f.node_spans, f.intersect_with_answer
         node_num = len(node_spans)
         # 构造训练用的node_spans & labels
         _node_spans = []
+        _intersect_with_answer = []
         cnt = 0
-        # 只选择negative加入到node spans
-        for i in range(node_num):
-            if cnt >= args.max_num_nodes:
-                break
-            if not intersect_with_answer[i]:
-                _node_spans.append(node_spans[i])
+        ##########################
+        # 如果node_num <= max_num_nodes, 将全部nodes放入train/test data，然后padding
+        # 如果node_num > max_num_nodes, 将不放回抽取max_num_nodes个nodes放入train/test data
+        if node_num <= args.max_num_nodes:
+            _node_spans.extend(node_spans)
+            _intersect_with_answer.extend(intersect_with_answer)
+            cnt = node_num
+            while cnt < args.max_num_nodes:
+                _node_spans.append(node_spans[-1])
+                _intersect_with_answer.append(-100)
                 cnt += 1
-        node_num = cnt    # negative node num
-        # 最后padding
-        while cnt <= args.max_num_nodes:
-            _node_spans.append(_node_spans[-1])
-            cnt += 1
+        else:
+            chosen = np.random.choice(node_num, size=args.max_num_nodes, replace=False)
+            _node_spans.extend([node_spans[i] for i in chosen])
+            _intersect_with_answer.extend([intersect_with_answer[i] for i in chosen])
         # 添加到全体
         all_node_spans.append(_node_spans)
         all_num_nodes.append(min(node_num, args.max_num_nodes))
+        all_intersect_with_answer.append(_intersect_with_answer)
     
     all_node_spans = torch.tensor(all_node_spans, dtype=torch.long)
     all_num_nodes = torch.tensor(all_num_nodes, dtype=torch.long)
+    all_intersect_with_answer = torch.tensor(all_intersect_with_answer, dtype=torch.long)
 
     all_feature_index = torch.arange(all_input_ids.size(0), dtype=torch.long)
     dataset = StrucDataset(all_input_ids, all_input_mask, all_segment_ids,
                            all_xpath_tags_seq, all_xpath_subs_seq,
                            all_start_positions, all_end_positions,
                            all_node_spans, all_num_nodes, all_feature_index,
-                           all_query_span)
+                           all_query_span, all_intersect_with_answer)
 
     
     if output_examples:
@@ -560,7 +553,6 @@ def parse():
     parser.add_argument('--server_ip', type=str, default='', help="Can be used for distant debugging.")
     parser.add_argument('--server_port', type=str, default='', help="Can be used for distant debugging.")
     parser.add_argument('--max_num_nodes', type=int, default=92, help="The number of node spans per case during training.")
-    parser.add_argument('--num_removed_nodes', type=int, default=92, help="The number of removed node spans per case during training.")
     args = parser.parse_args()
 
     return args
@@ -659,7 +651,7 @@ def main():
                 os.path.dirname(c) for c in sorted(glob.glob(args.output_dir + '/**/' + WEIGHTS_NAME, recursive=True)))
             # 排个序
             checkpoints = filter(lambda p: re.match(r'checkpoint-\d+', os.path.basename(p)), checkpoints)
-            checkpoints = sorted(checkpoints, key=lambda x: int(x.split('-')[-1]))
+            checkpoints = sorted(checkpoints, key=lambda x: int(x.split('-')[-1]))[13:]
             logging.getLogger("transformers.modeling_utils").setLevel(logging.WARN)  # Reduce model loading logs
 
         logger.info("Evaluate the following checkpoints: %s", checkpoints)

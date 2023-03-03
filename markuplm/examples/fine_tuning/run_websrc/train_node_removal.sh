@@ -1,8 +1,8 @@
-CUDA_VISIBLE_DEVICES=0,1,2,3 python run_node_removal.py \
+CUDA_VISIBLE_DEVICES=2,3,4,5 python run_node_removal.py \
 	--train_file /home/v-lizimeng/data/WebSRC/websrc1.0_train_.json \
 	--root_dir /home/v-lizimeng/data/WebSRC \
-	--model_name_or_path microsoft/markuplm-base \
-	--output_dir /home/v-lizimeng/unilm/markuplm/examples/fine_tuning/run_websrc/results_node_removal \
+	--model_name_or_path microsoft/markuplm-large \
+	--output_dir /home/v-lizimeng/unilm/markuplm/examples/fine_tuning/run_websrc/results_node_removal_L \
 	--do_train \
 	--save_steps 1000 \
 	--max_query_length 42 \
@@ -11,4 +11,4 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python run_node_removal.py \
 	--per_gpu_train_batch_size 4 \
 	--warmup_ratio 0.1 \
 	--num_train_epochs 5 \
-	--max_num_nodes 92
+	--max_num_nodes 96

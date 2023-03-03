@@ -28,8 +28,6 @@ from utils import StrucDataset
 from utils import (read_squad_examples, convert_examples_to_features, RawResult, write_predictions)
 from utils_evaluate import EvalOpts, main as evaluate_on_squad
 
-# from matplotlib import pyplot as plt
-
 
 logger = logging.getLogger(__name__)
 np.set_printoptions(precision=3)
@@ -133,15 +131,17 @@ def train(args, train_dataset, model, tokenizer, max_depth):
                       'node_labels': batch[9],
                       'query_span': batch[10],
                       'num_nodes': batch[11],
-                      'max_num_nodes': args.max_num_nodes,
-                      }
+                      'max_num_nodes': args.max_num_nodes}
 
             outputs = model(**inputs)
             loss_per_layer = outputs[1].mean(dim=0)    # [gpus * num_layers] -> [num_layers]
             loss = loss_per_layer.mean()
 
-            if step % 15 == 0:
-                print ("epoch:", epoch, "step:", step, "loss per layer:", loss_per_layer.detach().cpu().numpy(), "total loss:", round(loss.item(), 5))
+            if step % 20 == 0:
+                print (
+                    "epoch:", epoch, "step:", step, 
+                    "loss per layer:", loss_per_layer.detach().cpu().numpy(), 
+                    "total loss:", round(loss.item(), 5))
                 print ()
                 sys.stdout.flush()
 
@@ -262,8 +262,12 @@ def evaluate(args, eval_dataset, model, tokenizer, max_depth, prefix=""):
             page_preds = (page_logits >= 0)
             tmp = (page_preds & page_labels).sum(axis=1)
             page_precision = tmp / page_preds.sum(axis=1)
-            page_precision[np.isnan(page_precision)] = 0
+            if page_labels.sum() > 0:
+                page_precision[np.isnan(page_precision)] = 0.
+            else:
+                page_precision[np.isnan(page_precision)] = 1.
             page_recall = tmp / page_labels.sum()
+            page_recall[np.isnan(page_recall)] = 1.
             precisions.append(page_precision)
             recalls.append(page_recall)
 
@@ -450,83 +454,94 @@ def load_and_cache_examples(args, tokenizer, max_depth=50, evaluate=False, outpu
         node_num = len(node_spans)
         assert node_num == len(is_answer_node)
         assert node_num == len(intersect_with_answer)
-        # assert node_num == len(node_levels)
         # 构造训练用的node_spans & labels
         _node_spans = []
         _is_answer_node = []
         _intersect_with_answer = []
         # _node_levels = []
-        neg_ids = list(range(node_num))
-        cnt = 0
-        # 先选择positive加入到training data
-        for i in range(node_num):
-            if cnt >= args.max_num_nodes:
-                break
-            if intersect_with_answer[i]:
-                _node_spans.append(node_spans[i])
-                _is_answer_node.append(is_answer_node[i])
-                _intersect_with_answer.append(intersect_with_answer[i])
-                # _node_levels.append(node_levels[i])
-                neg_ids.remove(i)
+        # neg_ids = list(range(node_num))
+        # cnt = 0
+        # # 先选择positive加入到training data
+        # for i in range(node_num):
+        #     if cnt >= args.max_num_nodes:
+        #         break
+        #     if intersect_with_answer[i]:
+        #         _node_spans.append(node_spans[i])
+        #         _is_answer_node.append(is_answer_node[i])
+        #         _intersect_with_answer.append(intersect_with_answer[i])
+        #         # _node_levels.append(node_levels[i])
+        #         neg_ids.remove(i)
+        #         cnt += 1
+        # # 再选择negative加入
+        # random.shuffle(neg_ids)
+        # for i in neg_ids:
+        #     if cnt >= args.max_num_nodes:
+        #         break
+        #     _node_spans.append(node_spans[i])
+        #     _is_answer_node.append(is_answer_node[i])
+        #     _intersect_with_answer.append(intersect_with_answer[i])
+        #     # _node_levels.append(node_levels[i])
+        #     cnt += 1
+        # # 最后padding
+        # while cnt < args.max_num_nodes:
+        #     _node_spans.append(node_spans[-1])
+        #     _is_answer_node.append(-100)
+        #     _intersect_with_answer.append(-100)
+        #     # _node_levels.append(-1)
+        #     cnt += 1
+        # 构造训练用的node_spans & labels
+        # 如果node_num <= max_num_nodes, 将全部nodes放入train/test data，然后padding
+        # 如果node_num > max_num_nodes, 将不放回抽取max_num_nodes个nodes放入train/test data
+        if node_num <= args.max_num_nodes:
+            _node_spans.extend(node_spans)
+            _is_answer_node.extend(is_answer_node)
+            _intersect_with_answer.extend(intersect_with_answer)
+            cnt = node_num
+            while cnt < args.max_num_nodes:
+                _node_spans.append(node_spans[-1])
+                _is_answer_node.append(is_answer_node[-1])
+                _intersect_with_answer.append(-100)
                 cnt += 1
-        # 再选择negative加入
-        random.shuffle(neg_ids)
-        for i in neg_ids:
-            if cnt >= args.max_num_nodes:
-                break
-            _node_spans.append(node_spans[i])
-            _is_answer_node.append(is_answer_node[i])
-            _intersect_with_answer.append(intersect_with_answer[i])
-            # _node_levels.append(node_levels[i])
-            cnt += 1
-        # 最后padding
-        while cnt < args.max_num_nodes:
-            _node_spans.append(node_spans[-1])
-            _is_answer_node.append(-100)
-            _intersect_with_answer.append(-100)
-            # _node_levels.append(-1)
-            cnt += 1
+        else:
+            chosen = np.random.choice(node_num, size=args.max_num_nodes, replace=False)
+            _node_spans.extend([node_spans[i] for i in chosen])
+            _is_answer_node.extend([is_answer_node[i] for i in chosen])
+            _intersect_with_answer.extend([intersect_with_answer[i] for i in chosen])
         # 添加到全体
         all_node_spans.append(_node_spans)
         all_is_answer_node.append(_is_answer_node)
         all_intersect_with_answer.append(_intersect_with_answer)
         all_query_span.append(f.query_span)
         all_num_nodes.append(min(node_num, args.max_num_nodes))
-        all_node_levels.append(node_levels[:16] if len(node_levels)>=16 else node_levels+[-1]*(16-len(node_levels)))
+        # all_node_levels.append(node_levels[:16] if len(node_levels)>=16 else node_levels+[-1]*(16-len(node_levels)))
     
     all_query_span = torch.tensor(all_query_span, dtype=torch.long)
     all_node_spans = torch.tensor(all_node_spans, dtype=torch.long)
     all_is_answer_node = torch.tensor(all_is_answer_node, dtype=torch.long)
     all_intersect_with_answer = torch.tensor(all_intersect_with_answer, dtype=torch.long)
     all_num_nodes = torch.tensor(all_num_nodes, dtype=torch.long)
-    all_node_levels = torch.tensor(all_node_levels, dtype=torch.long)
+    # all_node_levels = torch.tensor(all_node_levels, dtype=torch.long)
 
     dataset = StrucDataset(all_input_ids, all_input_mask, all_segment_ids,
                            all_xpath_tags_seq, all_xpath_subs_seq,
                            all_start_positions, all_end_positions,
                            all_node_spans, all_is_answer_node, all_intersect_with_answer,
-                           all_query_span, all_num_nodes, all_node_levels)
+                           all_query_span, all_num_nodes)
 
     # if output_examples:
     #     dataset = (dataset, examples, features)
     
     return dataset
 
-def is_integer(x:str):
-    try:
-        int(x)
-        return True
-    except:
-        return False
 
 
 def main():
     parser = argparse.ArgumentParser()
 
     # Required parameters
-    parser.add_argument("--train_file", default=None, type=str, required=True,
+    parser.add_argument("--train_file", default=None, type=str,
                         help="json for training. E.g., train-v1.1.json")
-    parser.add_argument("--predict_file", default=None, type=str, required=True,
+    parser.add_argument("--predict_file", default=None, type=str,
                         help="json for predictions. E.g., dev-v1.1.json or test-v1.1.json")
     parser.add_argument("--root_dir", default=None, type=str, required=True,
                         help="the root directory of the raw WebSRC dataset, which contains the HTML files.")
@@ -747,8 +762,8 @@ def main():
             model.to(args.device)
 
             # Evaluate
-            evaluate2(args, eval_dataset, model, tokenizer, max_depth=max_depth, prefix=global_step)
-            # result = evaluate(args, model, tokenizer, max_depth=max_depth, prefix=global_step)
+            # evaluate2(args, eval_dataset, model, tokenizer, max_depth=max_depth, prefix=global_step)
+            result = evaluate(args, eval_dataset, model, tokenizer, max_depth=max_depth, prefix=global_step)
 
             # result = dict((k + ('_{}'.format(global_step) if global_step else ''), v) for k, v in result.items())
             # results.update(result)
