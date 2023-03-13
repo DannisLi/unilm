@@ -1386,24 +1386,20 @@ class MarkupLMForQuestionAnswering_true_removal(MarkupLMPreTrainedModel):
         else:
             return start_logits, end_logits
 
-'''
+
 class MarkupLMForQuestionAnswering_node_removal(MarkupLMPreTrainedModel):
 
     def __init__(self, config):
         super().__init__(config)
         self.config = config
         self.markuplm = MarkupLMModel(config, add_pooling_layer=False)
-        # node removal module
+        # node removal layer
         self.node_removal_layer = nn.Sequential(
-            # nn.Dropout(0.1),
             nn.Linear(config.hidden_size*2, config.hidden_size),
-            # nn.Dropout(0.1),
             nn.GELU(),
-            # nn.Linear(config.hidden_size, config.hidden_size),
-            # nn.Dropout(0.1),
-            # nn.GELU(),
             nn.Linear(config.hidden_size, 1),
         )
+        # self.node_removal_layer = nn.Linear(config.hidden_size*2, 1)
         # qa output
         self.qa_outputs = nn.Linear(config.hidden_size, 2)
         self.init_weights()
@@ -1556,9 +1552,9 @@ class MarkupLMForQuestionAnswering_node_removal(MarkupLMPreTrainedModel):
             return  total_loss, start_logits, end_logits
         else:
             return start_logits, end_logits
-'''
 
-class MarkupLMForQuestionAnswering_node_removal(MarkupLMPreTrainedModel):
+
+class MarkupLMForQuestionAnswering_node_removal_v2(MarkupLMPreTrainedModel):
 
     def __init__(self, config):
         super().__init__(config)

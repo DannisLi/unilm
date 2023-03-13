@@ -54,6 +54,8 @@ def to_list(tensor):
     return tensor.detach().cpu().tolist()
 
 
+# def train_node_removal(args, train_dataset, model, tokenizer):
+
 
 def train(args, train_dataset, model, tokenizer):
     r"""
@@ -137,6 +139,7 @@ def train(args, train_dataset, model, tokenizer):
                       'end_positions': batch[6],
                       'node_spans': batch[7],
                       'query_span': batch[10],
+                      'intersect_with_answer_labels': batch[11],
                       }
             
             def node_removal_objective(params):
@@ -155,15 +158,15 @@ def train(args, train_dataset, model, tokenizer):
                 return loss.item()
             
             # optmize parameters in node removal layer
-            if step % 5 == 0:
-                node_removal_layer = model.module.node_removal_layer
+            if step % 1 == 0:
+                tmp = model.module.node_removal_layer
                 ng_optimizer = ng.optimizers.NGOpt(
                     parametrization = ng.p.Dict(
-                        w1 = ng.p.Array(init=node_removal_layer[0].weight.detach().cpu().numpy()),
-                        b1 = ng.p.Array(init=node_removal_layer[0].bias.detach().cpu().numpy()),
-                        w2 = ng.p.Array(init=node_removal_layer[2].weight.detach().cpu().numpy()),
-                        b2 = ng.p.Array(init=node_removal_layer[2].bias.detach().cpu().numpy()),
-                    ), budget=15)
+                        w1 = ng.p.Array(init=tmp[0].weight.detach().cpu().numpy()),
+                        b1 = ng.p.Array(init=tmp[0].bias.detach().cpu().numpy()),
+                        w2 = ng.p.Array(init=tmp[2].weight.detach().cpu().numpy()),
+                        b2 = ng.p.Array(init=tmp[2].bias.detach().cpu().numpy()),
+                    ), budget=5)
                 node_removal_params = ng_optimizer.minimize(node_removal_objective).value
                 # load parameters
                 state_dict = OrderedDict()
@@ -172,8 +175,6 @@ def train(args, train_dataset, model, tokenizer):
                 state_dict['2.weight'] = torch.from_numpy(node_removal_params['w2'])
                 state_dict['2.bias'] = torch.from_numpy(node_removal_params['b2'])
                 model.module.node_removal_layer.load_state_dict(state_dict)
-
-                del node_removal_layer, ng_optimizer, node_removal_params, state_dict
 
             outputs = model(**inputs)
             loss = outputs[0]  # model outputs are always tuple in transformers (see doc)
@@ -398,44 +399,44 @@ def load_and_cache_examples(args, tokenizer, max_depth=50, evaluate=False, outpu
     # construct node spans
     all_node_spans = []
     all_num_nodes = []    # how many valid nodes of each page
-    # all_intersect_with_answer = []
+    all_intersect_with_answer = []
     for f in features:
         node_spans, intersect_with_answer = f.node_spans, f.intersect_with_answer
         node_num = len(node_spans)
         # 构造训练用的node_spans & labels
         _node_spans = []
-        # _intersect_with_answer = []
+        _intersect_with_answer = []
         cnt = 0
         ##########################
         # 如果node_num <= max_num_nodes, 将全部nodes放入train/test data，然后padding
         # 如果node_num > max_num_nodes, 将不放回抽取max_num_nodes个nodes放入train/test data
         if node_num <= args.max_num_nodes:
             _node_spans.extend(node_spans)
-            # _intersect_with_answer.extend(intersect_with_answer)
+            _intersect_with_answer.extend(intersect_with_answer)
             cnt = node_num
             while cnt < args.max_num_nodes:
                 _node_spans.append(node_spans[-1])
-                # _intersect_with_answer.append(-100)
+                _intersect_with_answer.append(-100)
                 cnt += 1
         else:
             chosen = np.random.choice(node_num, size=args.max_num_nodes, replace=False)
             _node_spans.extend([node_spans[i] for i in chosen])
-            # _intersect_with_answer.extend([intersect_with_answer[i] for i in chosen])
+            _intersect_with_answer.extend([intersect_with_answer[i] for i in chosen])
         # 添加到全体
         all_node_spans.append(_node_spans)
         all_num_nodes.append(min(node_num, args.max_num_nodes))
-        # all_intersect_with_answer.append(_intersect_with_answer)
+        all_intersect_with_answer.append(_intersect_with_answer)
     
     all_node_spans = torch.tensor(all_node_spans, dtype=torch.long)
     all_num_nodes = torch.tensor(all_num_nodes, dtype=torch.long)
-    # all_intersect_with_answer = torch.tensor(all_intersect_with_answer, dtype=torch.long)
+    all_intersect_with_answer = torch.tensor(all_intersect_with_answer, dtype=torch.long)
 
     all_feature_index = torch.arange(all_input_ids.size(0), dtype=torch.long)
     dataset = StrucDataset(all_input_ids, all_input_mask, all_segment_ids,
                            all_xpath_tags_seq, all_xpath_subs_seq,
                            all_start_positions, all_end_positions,
                            all_node_spans, all_num_nodes, all_feature_index,
-                           all_query_span)
+                           all_query_span, all_intersect_with_answer)
 
     
     if output_examples:
