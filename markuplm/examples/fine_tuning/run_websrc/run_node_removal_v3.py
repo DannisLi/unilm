@@ -12,6 +12,7 @@ import time
 import nevergrad as ng
 from collections import OrderedDict
 import copy
+import math
 
 from scipy.optimize import minimize
 import numpy as np
@@ -54,7 +55,6 @@ def to_list(tensor):
     return tensor.detach().cpu().tolist()
 
 
-# def train_node_removal(args, train_dataset, model, tokenizer):
 
 
 def train(args, train_dataset, model, tokenizer):
@@ -67,14 +67,22 @@ def train(args, train_dataset, model, tokenizer):
         tb_writer = None
 
     args.train_batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu)
+    args.ng_batch_size = args.per_gpu_ng_batch_size * max(1, args.n_gpu)
     train_sampler = RandomSampler(train_dataset) if args.local_rank == -1 else DistributedSampler(train_dataset)
-    train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size)
+    # train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size)
+    train_dataloader = DataLoader(
+        train_dataset, 
+        sampler=train_sampler, 
+        batch_size=args.ng_batch_size)
 
     if args.max_steps > 0:
-        t_total = args.max_steps
-        args.num_train_epochs = args.max_steps // (len(train_dataloader) // args.gradient_accumulation_steps) + 1
+        # 不考虑设置max_steps的情况
+        assert False
+        # t_total = args.max_steps
+        # args.num_train_epochs = args.max_steps // (len(train_dataloader) // args.gradient_accumulation_steps) + 1
     else:
-        t_total = len(train_dataloader) // args.gradient_accumulation_steps * args.num_train_epochs
+        # t_total = len(train_dataloader) // args.gradient_accumulation_steps * args.num_train_epochs
+        t_total = math.ceil(len(train_dataset) / args.train_batch_size) // args.gradient_accumulation_steps * args.num_train_epochs
 
     # Prepare optimizer and schedule (linear warmup and decay)
     no_decay = ['bias', 'LayerNorm.weight']
@@ -87,6 +95,7 @@ def train(args, train_dataset, model, tokenizer):
     scheduler = get_linear_schedule_with_warmup(optimizer,
                                                 num_warmup_steps=int(args.warmup_ratio * t_total),
                                                 num_training_steps=t_total)
+    
     if args.fp16:
         try:
             from apex import amp
@@ -104,6 +113,17 @@ def train(args, train_dataset, model, tokenizer):
                                                           output_device=args.local_rank,
                                                           find_unused_parameters=True)
 
+    # build nevergrad optimizer
+    tmp = model.module.node_removal_layer
+    ng_optimizer = ng.optimizers.registry[args.ng_optimizer](
+        parametrization=ng.p.Dict(
+            w1 = ng.p.Array(init=tmp[0].weight.detach().cpu().numpy()),
+            b1 = ng.p.Array(init=tmp[0].bias.detach().cpu().numpy()),
+            w2 = ng.p.Array(init=tmp[2].weight.detach().cpu().numpy()),
+            b2 = ng.p.Array(init=tmp[2].bias.detach().cpu().numpy()),
+        ), budget=20000)
+    del tmp
+    
     # Train!
     logger.info("***** Running training *****")
     logger.info("  Num examples = %d", len(train_dataset))
@@ -118,6 +138,7 @@ def train(args, train_dataset, model, tokenizer):
     global_step = 0
     tr_loss, logging_loss = 0.0, 0.0
     model.zero_grad()
+    model.train()
     # train_iterator = trange(int(args.num_train_epochs), desc="Epoch", disable=args.local_rank not in [-1, 0])
     train_iterator = range(int(args.num_train_epochs))
     set_seed(args)  # Added here for reproductibility (even between python 2 and 3)
@@ -126,122 +147,140 @@ def train(args, train_dataset, model, tokenizer):
             train_dataloader.sampler.set_epoch(epoch)
         # epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
         timer = time.time()
-        for step, batch in enumerate(train_dataloader):
-            model.train()
+        step = 0    # 标定loss在epoch内的步数
+        for ng_step, batch in enumerate(train_dataloader):
             batch = tuple(t.to(args.device) for t in batch)
             
-            inputs = {'input_ids': batch[0],
-                      'attention_mask': batch[1],
-                      'token_type_ids': batch[2],
-                      'xpath_tags_seq': batch[3],
-                      'xpath_subs_seq': batch[4],
-                      'start_positions': batch[5],
-                      'end_positions': batch[6],
-                      'node_spans': batch[7],
-                      'query_span': batch[10],
-                      'intersect_with_answer_labels': batch[11],
-                      }
+            # 1. 训练node removal layer (nevergrad)
+            inputs_for_ng = {
+                'input_ids': batch[0],
+                'attention_mask': batch[1],
+                'token_type_ids': batch[2],
+                'xpath_tags_seq': batch[3],
+                'xpath_subs_seq': batch[4],
+                'start_positions': batch[5],
+                'end_positions': batch[6],
+                'node_spans': batch[7],
+                'query_span': batch[10]}
             
             def node_removal_objective(params):
-                # load parameters into node removal layer
+                # 1. load parameters into node removal layer
                 state_dict = OrderedDict()
                 state_dict['0.weight'] = torch.from_numpy(params['w1'])
                 state_dict['0.bias'] = torch.from_numpy(params['b1'])
                 state_dict['2.weight'] = torch.from_numpy(params['w2'])
                 state_dict['2.bias'] = torch.from_numpy(params['b2'])
                 model.module.node_removal_layer.load_state_dict(state_dict)
-                
+                # 2. calculate objective
                 with torch.no_grad():
-                    loss = model(**inputs)[0]
+                    loss = model(**inputs_for_ng)[0]
                     if args.n_gpu > 1:
                         loss = loss.mean()
                 return loss.item()
             
-            # optmize parameters in node removal layer
-            if step % 1 == 0:
-                tmp = model.module.node_removal_layer
-                ng_optimizer = ng.optimizers.NGOpt(
-                    parametrization = ng.p.Dict(
-                        w1 = ng.p.Array(init=tmp[0].weight.detach().cpu().numpy()),
-                        b1 = ng.p.Array(init=tmp[0].bias.detach().cpu().numpy()),
-                        w2 = ng.p.Array(init=tmp[2].weight.detach().cpu().numpy()),
-                        b2 = ng.p.Array(init=tmp[2].bias.detach().cpu().numpy()),
-                    ), budget=5)
-                node_removal_params = ng_optimizer.minimize(node_removal_objective).value
-                # load parameters
-                state_dict = OrderedDict()
-                state_dict['0.weight'] = torch.from_numpy(node_removal_params['w1'])
-                state_dict['0.bias'] = torch.from_numpy(node_removal_params['b1'])
-                state_dict['2.weight'] = torch.from_numpy(node_removal_params['w2'])
-                state_dict['2.bias'] = torch.from_numpy(node_removal_params['b2'])
-                model.module.node_removal_layer.load_state_dict(state_dict)
-
-            outputs = model(**inputs)
-            loss = outputs[0]  # model outputs are always tuple in transformers (see doc)
-
-            if args.n_gpu > 1:
-                loss = loss.mean()  # mean() to average on multi-gpu parallel (not distributed) training
-
-            if step % 20 == 0:
-                print ("epoch:", epoch, "step:", step, "loss:", round(loss.item(), 5), "time:", round(time.time()-timer, 2))
-                timer = time.time()
-                sys.stdout.flush()
+            with torch.no_grad():
+                for _ in range(args.ng_steps):
+                    t = ng_optimizer.ask()
+                    loss_t = node_removal_objective(t.value)
+                    ng_optimizer.tell(t, loss_t)
+                node_removal_params = ng_optimizer.recommend().value
+            # load parameters
+            state_dict = OrderedDict()
+            state_dict['0.weight'] = torch.from_numpy(node_removal_params['w1'])
+            state_dict['0.bias'] = torch.from_numpy(node_removal_params['b1'])
+            state_dict['2.weight'] = torch.from_numpy(node_removal_params['w2'])
+            state_dict['2.bias'] = torch.from_numpy(node_removal_params['b2'])
+            model.module.node_removal_layer.load_state_dict(state_dict)
             
-            if args.gradient_accumulation_steps > 1:
-                loss = loss / args.gradient_accumulation_steps
+            del state_dict, t, loss_t, node_removal_params, inputs_for_ng
 
-            if args.fp16:
-                with amp.scale_loss(loss, optimizer) as scaled_loss:
-                    scaled_loss.backward()
-            else:
-                loss.backward()
+            # 2  训练MarkupLM部分
+            for i in range(math.ceil(batch[0].size(0) / args.train_batch_size)):
+                inputs = {
+                    'input_ids': batch[0][i*args.train_batch_size:(i+1)*args.train_batch_size],
+                    'attention_mask': batch[1][i*args.train_batch_size:(i+1)*args.train_batch_size],
+                    'token_type_ids': batch[2][i*args.train_batch_size:(i+1)*args.train_batch_size],
+                    'xpath_tags_seq': batch[3][i*args.train_batch_size:(i+1)*args.train_batch_size],
+                    'xpath_subs_seq': batch[4][i*args.train_batch_size:(i+1)*args.train_batch_size],
+                    'start_positions': batch[5][i*args.train_batch_size:(i+1)*args.train_batch_size],
+                    'end_positions': batch[6][i*args.train_batch_size:(i+1)*args.train_batch_size],
+                    'node_spans': batch[7][i*args.train_batch_size:(i+1)*args.train_batch_size],
+                    'query_span': batch[10][i*args.train_batch_size:(i+1)*args.train_batch_size]}
 
-            tr_loss += loss.item()
-            if (step + 1) % args.gradient_accumulation_steps == 0:
+                outputs = model(**inputs)
+                loss = outputs[0]  # model outputs are always tuple in transformers (see doc)
+                step += 1
+
+                if args.n_gpu > 1:
+                    loss = loss.mean()  # mean() to average on multi-gpu parallel (not distributed) training
+                
+                if step % 20 == 0:
+                    print("epoch:", epoch, "step:", step, "loss:", round(loss.item(), 5), "time:", round(time.time()-timer, 2))
+                    timer = time.time()
+                    sys.stdout.flush()
+                
+                if args.gradient_accumulation_steps > 1:
+                    loss = loss / args.gradient_accumulation_steps
+
                 if args.fp16:
-                    torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
+                    with amp.scale_loss(loss, optimizer) as scaled_loss:
+                        scaled_loss.backward()
                 else:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                    loss.backward()
 
-                optimizer.step()
-                scheduler.step()  # Update learning rate schedule
-                model.zero_grad()
-                global_step += 1
+                tr_loss += loss.item()
+                if (step + 1) % args.gradient_accumulation_steps == 0:
+                    if args.fp16:
+                        torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
+                    else:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 
-                if args.local_rank in [-1, 0] and args.logging_steps > 0 and global_step % args.logging_steps == 0:
-                    # Log metrics
-                    if args.local_rank == -1 and args.evaluate_during_training:
-                        results = evaluate(args, model, tokenizer, max_depth=max_depth, prefix=str(global_step))
-                        for key, value in results.items():
-                            tb_writer.add_scalar('eval_{}'.format(key), value, global_step)
-                    tb_writer.add_scalar('lr', scheduler.get_lr()[0], global_step)
-                    tb_writer.add_scalar('loss', (tr_loss - logging_loss) / args.logging_steps, global_step)
-                    logging_loss = tr_loss
+                    optimizer.step()
+                    scheduler.step()  # Update learning rate schedule
+                    model.zero_grad()
+                    global_step += 1
 
-                if args.local_rank in [-1, 0] and args.save_steps > 0 and global_step % args.save_steps == 0:
-                    # Save model checkpoint
-                    output_dir = os.path.join(args.output_dir, 'checkpoint-{}'.format(global_step))
-                    if not os.path.exists(output_dir):
-                        os.makedirs(output_dir)
-                    model_to_save = model.module if hasattr(model, 'module') else model
-                    # Take care of distributed/parallel training
-                    model_to_save.save_pretrained(output_dir)
-                    torch.save(args, os.path.join(output_dir, 'training_args.bin'))
-                    logger.info("Saving model checkpoint to %s", output_dir)
+                    # write to tensorboard
+                    # if args.local_rank in [-1, 0] and args.logging_steps > 0 and global_step % args.logging_steps == 0:
+                    #     # Log metrics
+                    #     if args.local_rank == -1 and args.evaluate_during_training:
+                    #         results = evaluate(args, model, tokenizer, max_depth=max_depth, prefix=str(global_step))
+                    #         for key, value in results.items():
+                    #             tb_writer.add_scalar('eval_{}'.format(key), value, global_step)
+                    #     tb_writer.add_scalar('lr', scheduler.get_lr()[0], global_step)
+                    #     tb_writer.add_scalar('loss', (tr_loss - logging_loss) / args.logging_steps, global_step)
+                    #     logging_loss = tr_loss
 
-            del batch, inputs, outputs, loss
+                    # save to checkpoint
+                    if args.local_rank in [-1, 0] and args.save_steps > 0 and global_step % args.save_steps == 0:
+                        # Save model checkpoint
+                        output_dir = os.path.join(args.output_dir, 'checkpoint-{}'.format(global_step))
+                        if not os.path.exists(output_dir):
+                            os.makedirs(output_dir)
+                        model_to_save = model.module if hasattr(model, 'module') else model
+                        # Take care of distributed/parallel training
+                        model_to_save.save_pretrained(output_dir)
+                        torch.save(args, os.path.join(output_dir, 'training_args.bin'))
+                        logger.info("Saving model checkpoint to %s", output_dir)
 
-            if 0 < args.max_steps < global_step:
-                # epoch_iterator.close()
-                break
-        if 0 < args.max_steps < global_step:
-            train_iterator.close()
-            break
+                del inputs, outputs, loss
+            
+            del batch
+            
+            # accumulated_batches = []
+
+            # if 0 < args.max_steps < global_step:
+            #     epoch_iterator.close()
+            #     break
+        # if 0 < args.max_steps < global_step:
+        #     train_iterator.close()
+        #     break
 
     if args.local_rank in [-1, 0]:
         tb_writer.close()
 
     return global_step, tr_loss / global_step
+
 
 
 def evaluate(args, data, model, tokenizer, max_depth, prefix=""):
@@ -399,44 +438,44 @@ def load_and_cache_examples(args, tokenizer, max_depth=50, evaluate=False, outpu
     # construct node spans
     all_node_spans = []
     all_num_nodes = []    # how many valid nodes of each page
-    all_intersect_with_answer = []
+    # all_intersect_with_answer = []
     for f in features:
         node_spans, intersect_with_answer = f.node_spans, f.intersect_with_answer
         node_num = len(node_spans)
         # 构造训练用的node_spans & labels
         _node_spans = []
-        _intersect_with_answer = []
+        # _intersect_with_answer = []
         cnt = 0
         ##########################
         # 如果node_num <= max_num_nodes, 将全部nodes放入train/test data，然后padding
         # 如果node_num > max_num_nodes, 将不放回抽取max_num_nodes个nodes放入train/test data
         if node_num <= args.max_num_nodes:
             _node_spans.extend(node_spans)
-            _intersect_with_answer.extend(intersect_with_answer)
+            # _intersect_with_answer.extend(intersect_with_answer)
             cnt = node_num
             while cnt < args.max_num_nodes:
                 _node_spans.append(node_spans[-1])
-                _intersect_with_answer.append(-100)
+                # _intersect_with_answer.append(-100)
                 cnt += 1
         else:
             chosen = np.random.choice(node_num, size=args.max_num_nodes, replace=False)
             _node_spans.extend([node_spans[i] for i in chosen])
-            _intersect_with_answer.extend([intersect_with_answer[i] for i in chosen])
+            # _intersect_with_answer.extend([intersect_with_answer[i] for i in chosen])
         # 添加到全体
         all_node_spans.append(_node_spans)
         all_num_nodes.append(min(node_num, args.max_num_nodes))
-        all_intersect_with_answer.append(_intersect_with_answer)
+        # all_intersect_with_answer.append(_intersect_with_answer)
     
     all_node_spans = torch.tensor(all_node_spans, dtype=torch.long)
     all_num_nodes = torch.tensor(all_num_nodes, dtype=torch.long)
-    all_intersect_with_answer = torch.tensor(all_intersect_with_answer, dtype=torch.long)
+    # all_intersect_with_answer = torch.tensor(all_intersect_with_answer, dtype=torch.long)
 
     all_feature_index = torch.arange(all_input_ids.size(0), dtype=torch.long)
     dataset = StrucDataset(all_input_ids, all_input_mask, all_segment_ids,
                            all_xpath_tags_seq, all_xpath_subs_seq,
                            all_start_positions, all_end_positions,
                            all_node_spans, all_num_nodes, all_feature_index,
-                           all_query_span, all_intersect_with_answer)
+                           all_query_span)
 
     
     if output_examples:
@@ -552,6 +591,13 @@ def parse():
     parser.add_argument('--server_ip', type=str, default='', help="Can be used for distant debugging.")
     parser.add_argument('--server_port', type=str, default='', help="Can be used for distant debugging.")
     parser.add_argument('--max_num_nodes', type=int, default=92, help="The number of node spans per case during training.")
+    parser.add_argument(
+        '--ng_optimizer', 
+        choices=["TwoPointsDE", "RandoSearmch", "TBPSA", "CMA", "NaiveTBPSA", "OnePlusOne", "NoisyOnePlusOne", "NGOpt", "RealSpacePSO", "OptimisticNoisyOnePlusOne", "NelderMead"], 
+        default="NGOpt", help="The nevergrad optimizer used to optimize params of node removal layer")
+    parser.add_argument('--per_gpu_ng_batch_size', type=int, default=80, help="")    # must be a multiple of per_gpu_train_batch_size
+    parser.add_argument('--ng_steps', type=int, default=20, help="")     # 每次优化多少步
+    parser.add_argument('--train_from_checkpoint', type=str, default="", help="")
     args = parser.parse_args()
 
     return args
@@ -597,7 +643,10 @@ def main():
     logger.info(str(config))
     max_depth = config.max_depth
     tokenizer = MarkupLMTokenizer.from_pretrained(args.model_name_or_path)
-    model = MarkupLMForQuestionAnswering_node_removal.from_pretrained(args.model_name_or_path, config=config)
+    if args.train_from_checkpoint:
+        model = MarkupLMForQuestionAnswering_node_removal.from_pretrained(args.train_from_checkpoint, config=config)
+    else: 
+        model = MarkupLMForQuestionAnswering_node_removal.from_pretrained(args.model_name_or_path, config=config)
 
     if args.local_rank == 0:
         torch.distributed.barrier()
@@ -650,7 +699,7 @@ def main():
                 os.path.dirname(c) for c in sorted(glob.glob(args.output_dir + '/**/' + WEIGHTS_NAME, recursive=True)))
             # 排个序
             checkpoints = filter(lambda p: re.match(r'checkpoint-\d+', os.path.basename(p)), checkpoints)
-            checkpoints = sorted(checkpoints, key=lambda x: int(x.split('-')[-1]))[20:]
+            checkpoints = sorted(checkpoints, key=lambda x: int(x.split('-')[-1]))[30:]
             logging.getLogger("transformers.modeling_utils").setLevel(logging.WARN)  # Reduce model loading logs
 
         logger.info("Evaluate the following checkpoints: %s", checkpoints)

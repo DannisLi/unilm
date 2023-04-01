@@ -1399,7 +1399,6 @@ class MarkupLMForQuestionAnswering_node_removal(MarkupLMPreTrainedModel):
             nn.GELU(),
             nn.Linear(config.hidden_size, 1),
         )
-        # self.node_removal_layer = nn.Linear(config.hidden_size*2, 1)
         # qa output
         self.qa_outputs = nn.Linear(config.hidden_size, 2)
         self.init_weights()
@@ -1583,6 +1582,7 @@ class MarkupLMForQuestionAnswering_node_removal_v2(MarkupLMPreTrainedModel):
         self.qa_outputs = nn.Linear(config.hidden_size, 2)
         # initialize
         self.init_weights()
+        # 
 
 
     def extend_attention_mask(self, attention_mask):

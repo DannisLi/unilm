@@ -85,6 +85,7 @@ def train(args, train_dataset, model, tokenizer):
     scheduler = get_linear_schedule_with_warmup(optimizer,
                                                 num_warmup_steps=int(args.warmup_ratio * t_total),
                                                 num_training_steps=t_total)
+
     if args.fp16:
         try:
             from apex import amp
@@ -124,10 +125,12 @@ def train(args, train_dataset, model, tokenizer):
             train_dataloader.sampler.set_epoch(epoch)
         # epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
         timer = time.time()
+        accumulated_data = []
         for step, batch in enumerate(train_dataloader):
             model.train()
             batch = tuple(t.to(args.device) for t in batch)
-            
+            accumulated_data.append(batch)
+
             inputs = {'input_ids': batch[0],
                       'attention_mask': batch[1],
                       'token_type_ids': batch[2],
@@ -140,31 +143,46 @@ def train(args, train_dataset, model, tokenizer):
                       }
             
             def node_removal_objective(params):
-                # load parameters into node removal layer
+                # 1. load parameters into node removal layer
                 state_dict = OrderedDict()
                 state_dict['0.weight'] = torch.from_numpy(params['w1'])
                 state_dict['0.bias'] = torch.from_numpy(params['b1'])
                 state_dict['2.weight'] = torch.from_numpy(params['w2'])
                 state_dict['2.bias'] = torch.from_numpy(params['b2'])
                 model.module.node_removal_layer.load_state_dict(state_dict)
-                
+                # 2. calculate objective
                 with torch.no_grad():
-                    loss = model(**inputs)[0]
+                    loss = model(**ng_inputs)[0]
                     if args.n_gpu > 1:
                         loss = loss.mean()
                 return loss.item()
             
             # optmize parameters in node removal layer
-            if step % 5 == 0:
-                node_removal_layer = model.module.node_removal_layer
-                ng_optimizer = ng.optimizers.NGOpt(
-                    parametrization = ng.p.Dict(
-                        w1 = ng.p.Array(init=node_removal_layer[0].weight.detach().cpu().numpy()),
-                        b1 = ng.p.Array(init=node_removal_layer[0].bias.detach().cpu().numpy()),
-                        w2 = ng.p.Array(init=node_removal_layer[2].weight.detach().cpu().numpy()),
-                        b2 = ng.p.Array(init=node_removal_layer[2].bias.detach().cpu().numpy()),
-                    ), budget=15)
-                node_removal_params = ng_optimizer.minimize(node_removal_objective).value
+            if step % 20 == 0:
+                with torch.no_grad():
+                    ng_inputs = []
+                    for t in range(len(accumulated_data[0])):
+                        ng_inputs.append(torch.cat([batch[t] for batch in accumulated_data], 0))
+                    ng_inputs = {
+                        'input_ids': ng_inputs[0],
+                        'attention_mask': ng_inputs[1],
+                        'token_type_ids': ng_inputs[2],
+                        'xpath_tags_seq': ng_inputs[3],
+                        'xpath_subs_seq': ng_inputs[4],
+                        'start_positions': ng_inputs[5],
+                        'end_positions': ng_inputs[6],
+                        'node_spans': ng_inputs[7],
+                        'query_span': ng_inputs[10]}
+                    node_removal_layer = model.module.node_removal_layer
+                    ng_optimizer = ng.optimizers.NGOpt(
+                        parametrization = ng.p.Dict(
+                            w1 = ng.p.Array(init=node_removal_layer[0].weight.detach().cpu().numpy()),
+                            b1 = ng.p.Array(init=node_removal_layer[0].bias.detach().cpu().numpy()),
+                            w2 = ng.p.Array(init=node_removal_layer[2].weight.detach().cpu().numpy()),
+                            b2 = ng.p.Array(init=node_removal_layer[2].bias.detach().cpu().numpy()),
+                        ), budget=80)
+                    node_removal_params = ng_optimizer.minimize(node_removal_objective).value
+                
                 # load parameters
                 state_dict = OrderedDict()
                 state_dict['0.weight'] = torch.from_numpy(node_removal_params['w1'])
@@ -173,7 +191,8 @@ def train(args, train_dataset, model, tokenizer):
                 state_dict['2.bias'] = torch.from_numpy(node_removal_params['b2'])
                 model.module.node_removal_layer.load_state_dict(state_dict)
 
-                del node_removal_layer, ng_optimizer, node_removal_params, state_dict
+                del node_removal_layer, ng_optimizer, node_removal_params, state_dict, accumulated_data, ng_inputs
+                accumulated_data = []
 
             outputs = model(**inputs)
             loss = outputs[0]  # model outputs are always tuple in transformers (see doc)
@@ -182,7 +201,7 @@ def train(args, train_dataset, model, tokenizer):
                 loss = loss.mean()  # mean() to average on multi-gpu parallel (not distributed) training
 
             if step % 20 == 0:
-                print ("epoch:", epoch, "step:", step, "loss:", round(loss.item(), 5), "time:", round(time.time()-timer, 2))
+                logger.info("epoch:", epoch, "step:", step, "loss:", round(loss.item(), 5), "time:", round(time.time()-timer, 2))
                 timer = time.time()
                 sys.stdout.flush()
             
@@ -404,31 +423,25 @@ def load_and_cache_examples(args, tokenizer, max_depth=50, evaluate=False, outpu
         node_num = len(node_spans)
         # 构造训练用的node_spans & labels
         _node_spans = []
-        # _intersect_with_answer = []
         cnt = 0
         ##########################
         # 如果node_num <= max_num_nodes, 将全部nodes放入train/test data，然后padding
         # 如果node_num > max_num_nodes, 将不放回抽取max_num_nodes个nodes放入train/test data
         if node_num <= args.max_num_nodes:
             _node_spans.extend(node_spans)
-            # _intersect_with_answer.extend(intersect_with_answer)
             cnt = node_num
             while cnt < args.max_num_nodes:
                 _node_spans.append(node_spans[-1])
-                # _intersect_with_answer.append(-100)
                 cnt += 1
         else:
             chosen = np.random.choice(node_num, size=args.max_num_nodes, replace=False)
             _node_spans.extend([node_spans[i] for i in chosen])
-            # _intersect_with_answer.extend([intersect_with_answer[i] for i in chosen])
         # 添加到全体
         all_node_spans.append(_node_spans)
         all_num_nodes.append(min(node_num, args.max_num_nodes))
-        # all_intersect_with_answer.append(_intersect_with_answer)
     
     all_node_spans = torch.tensor(all_node_spans, dtype=torch.long)
     all_num_nodes = torch.tensor(all_num_nodes, dtype=torch.long)
-    # all_intersect_with_answer = torch.tensor(all_intersect_with_answer, dtype=torch.long)
 
     all_feature_index = torch.arange(all_input_ids.size(0), dtype=torch.long)
     dataset = StrucDataset(all_input_ids, all_input_mask, all_segment_ids,
@@ -649,7 +662,7 @@ def main():
                 os.path.dirname(c) for c in sorted(glob.glob(args.output_dir + '/**/' + WEIGHTS_NAME, recursive=True)))
             # 排个序
             checkpoints = filter(lambda p: re.match(r'checkpoint-\d+', os.path.basename(p)), checkpoints)
-            checkpoints = sorted(checkpoints, key=lambda x: int(x.split('-')[-1]))[20:]
+            checkpoints = sorted(checkpoints, key=lambda x: int(x.split('-')[-1]))[40:]
             logging.getLogger("transformers.modeling_utils").setLevel(logging.WARN)  # Reduce model loading logs
 
         logger.info("Evaluate the following checkpoints: %s", checkpoints)

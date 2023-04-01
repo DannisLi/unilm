@@ -1,4 +1,4 @@
-CUDA_VISIBLE_DEVICES=0,1,2,3 python run_qa.py \
+CUDA_VISIBLE_DEVICES=0,1 python run_qa.py \
 	--train_file /home/v-lizimeng/data/WebSRC/websrc1.0_train_.json \
 	--root_dir /home/v-lizimeng/data/WebSRC \
 	--model_name_or_path microsoft/markuplm-base \
@@ -8,6 +8,6 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python run_qa.py \
 	--max_query_length 42 \
 	--max_seq_length 512 \
 	--learning_rate 1e-5 \
-	--per_gpu_train_batch_size 4 \
+	--per_gpu_train_batch_size 8 \
 	--warmup_ratio 0.1 \
 	--num_train_epochs 5
