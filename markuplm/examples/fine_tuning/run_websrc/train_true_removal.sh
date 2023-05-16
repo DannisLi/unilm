@@ -1,4 +1,4 @@
-CUDA_VISIBLE_DEVICES=0,1,2,3 python run_true_removal.py \
+CUDA_VISIBLE_DEVICES=0,1,2,3 python run_true_removal_v3.py \
 	--train_file /home/v-lizimeng/data/WebSRC/websrc1.0_train_.json \
 	--root_dir /home/v-lizimeng/data/WebSRC \
 	--model_name_or_path microsoft/markuplm-base \

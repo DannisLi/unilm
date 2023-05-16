@@ -1,4 +1,4 @@
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python run_true_removal.py \
+CUDA_VISIBLE_DEVICES=4,5,6,7 python run_true_removal.py \
 	--predict_file /home/v-lizimeng/data/WebSRC/websrc1.0_dev_.json \
 	--root_dir /home/v-lizimeng/data/WebSRC \
 	--model_name_or_path microsoft/markuplm-base \

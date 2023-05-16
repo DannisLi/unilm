@@ -28,6 +28,7 @@ from .modeling_markuplm import (
     MarkupLMModel,
     MarkupLMForNodeClassification,
     MarkupLMForQuestionAnswering_true_removal,
+    MarkupLMForQuestionAnswering_node_removal_v3,
 )
 
 _import_structure = {
@@ -47,6 +48,7 @@ if is_torch_available():
         "MarkupLMForNodeClassification",
         "MarkupLMForQuestionAnswering_true_removal",
         "MarkupLMForQuestionAnswering_node_removal",
+        "MarkupLMForQuestionAnswering_node_removal_v3",
     ]
 
 if TYPE_CHECKING:
@@ -65,6 +67,7 @@ if TYPE_CHECKING:
             MarkupLMForNodeClassification,
             MarkupLMForQuestionAnswering_true_removal,
             MarkupLMForQuestionAnswering_node_removal,
+            MarkupLMForQuestionAnswering_node_removal_v3,
         )
 
 else:

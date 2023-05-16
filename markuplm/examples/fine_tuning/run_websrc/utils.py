@@ -80,8 +80,9 @@ class SRCExample(object):
                  xpath_subs_map=None,
                  node_spans=None,
                  answer_node=None,
-                 intersect_with_answer=None,
+                #  intersect_with_answer=None,
                  node_levels=None,
+                 father_tids=None,
                  ):
         self.doc_tokens = doc_tokens
         self.qas_id = qas_id
@@ -99,8 +100,9 @@ class SRCExample(object):
         self.xpath_subs_map = xpath_subs_map
         self.node_spans = node_spans
         self.answer_node = answer_node
-        self.intersect_with_answer = intersect_with_answer
+        # self.intersect_with_answer = intersect_with_answer
         self.node_levels = node_levels
+        self.father_tids = father_tids
 
     def __str__(self):
         return self.__repr__()
@@ -187,9 +189,10 @@ class InputFeatures(object):
                  xpath_subs_seq=None,
                  node_spans=None,
                  is_answer_node=None,
-                 intersect_with_answer=None,
+                #  intersect_with_answer=None,
                  query_span=None,
                  node_levels=None,    # 从answer node开始向上数，ans node == 0, others == -1
+                 father_ids=None,
                  ):
         self.unique_id = unique_id
         self.example_index = example_index
@@ -210,9 +213,10 @@ class InputFeatures(object):
         self.xpath_subs_seq = xpath_subs_seq
         self.node_spans = node_spans
         self.is_answer_node = is_answer_node
-        self.intersect_with_answer = intersect_with_answer
+        # self.intersect_with_answer = intersect_with_answer
         self.query_span = query_span
         self.node_levels = node_levels
+        self.father_ids = father_ids
 
 
 def html_escape(html):
@@ -388,12 +392,14 @@ def read_squad_examples(input_file, root_dir, is_training, tokenizer, simplify=F
             unique_tids.add(w_t[s_tok[i]])
         return s_t, unique_tids
     
-    def get_father_tid_list(root, father_tid=-1):
-        res = [father_tid]
+    def get_father_tid_dict(root, father_tid=-1):
+        # tid: father tid
+        res = {int(root.attrs['tid']): father_tid}
+        # res = [father_tid]
         for element in root.children:
             if type(element) == bs4.element.Tag:
                 # print (root.attrs)
-                res.extend(get_father_tid_list(element, int(root.attrs['tid'])))
+                res.update(get_father_tid_dict(element, int(root.attrs['tid'])))
         return res
 
     examples = []
@@ -467,10 +473,10 @@ def read_squad_examples(input_file, root_dir, is_training, tokenizer, simplify=F
                     assert tag_num == len(w_spans), tag_num == len(s_spans)
 
                     # get tree structure of tid
-                    father_tid_list = get_father_tid_list(html_code.html, -1)
-                    father_tid_list.append(-1)    # for no and yes nodes
-                    father_tid_list.append(-1)
-                    assert len(father_tid_list) == tag_num
+                    father_tid_dict = get_father_tid_dict(html_code.html, -1)
+                    father_tid_dict[tag_num-2] = -1    # for no and yes nodes
+                    father_tid_dict[tag_num-1] = -1
+                    assert len(father_tid_dict) == tag_num
 
                     # Generate extra information for features
                     tok_to_tags_index, unique_tids = subtoken_tag_offset(w_t, tok_to_orig_index)    # tok_to_tags_index: all_doc_tokens中每个token对应的tid
@@ -491,8 +497,8 @@ def read_squad_examples(input_file, root_dir, is_training, tokenizer, simplify=F
                         end_position = None      # answer在doc_tokens中的终止位置
                         orig_answer_text = None
                         answer_node = None    # tid of answer node
-                        intersect_with_answer = set([])   # tid of node which intersect with answer
-                        node_levels = []    # tid: level
+                        # intersect_with_answer = set([])   # tid of node which intersect with answer
+                        # node_levels = []    # tid: level
 
                         if is_training:
                             if len(qa["answers"]) != 1:
@@ -528,22 +534,22 @@ def read_squad_examples(input_file, root_dir, is_training, tokenizer, simplify=F
                                                qa['id'], actual_text, cleaned_answer_text)
                                 continue
 
-                            _id = answer_node
-                            _level = 0
-                            while _id != -1:
-                                intersect_with_answer.add(_id)
-                                node_levels.append(_level)
-                                _level += 1
-                                _id = father_tid_list[_id]
-                            for _id in range(len(father_tid_list)):
-                                if _id in intersect_with_answer:
-                                    continue
-                                tmp = _id
-                                while tmp != -1:
-                                    if tmp == answer_node:
-                                        intersect_with_answer.add(_id)
-                                        break
-                                    tmp = father_tid_list[tmp]
+                            # _id = answer_node
+                            # _level = 0
+                            # while _id != -1:
+                            #     intersect_with_answer.add(_id)
+                            #     node_levels.append(_level)
+                            #     _level += 1
+                            #     _id = father_tid_list[_id]
+                            # for _id in range(len(father_tid_list)):
+                            #     if _id in intersect_with_answer:
+                            #         continue
+                            #     tmp = _id
+                            #     while tmp != -1:
+                            #         if tmp == answer_node:
+                            #             intersect_with_answer.add(_id)
+                            #             break
+                            #         tmp = father_tid_list[tmp]
 
                         example = SRCExample(
                             doc_tokens=doc_tokens,
@@ -562,8 +568,9 @@ def read_squad_examples(input_file, root_dir, is_training, tokenizer, simplify=F
                             xpath_subs_map=xpath_subs_map,
                             node_spans = s_spans,
                             answer_node = answer_node,
-                            intersect_with_answer = intersect_with_answer,
-                            node_levels = node_levels,
+                            # intersect_with_answer = intersect_with_answer,
+                            # node_levels = node_levels,
+                            father_tids = father_tid_dict,
                         )
 
                         examples.append(example)
@@ -629,9 +636,11 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length, doc_stride
         # node spans和is_answer_node
         node_spans = []
         is_answer_node = []
-        intersect_with_answer = []
+        # intersect_with_answer = []
+        father_ids = []    # here id means index in node_spans not tid in the raw page
         # node_levels = []
-        for tid in example.node_spans:
+        _tid2ind = {}
+        for tid in range(example.tag_num):
             s = example.node_spans[tid]
             if s[0] >= s[1]:
                 # node 没有文本内容
@@ -642,10 +651,17 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length, doc_stride
                 is_answer_node.append(1)
             else:
                 is_answer_node.append(0)
-            intersect_with_answer.append(1 if tid in example.intersect_with_answer else 0)
+            # father_ids
+            try:
+                father_ids.append(_tid2ind[example.father_tids[tid]])
+            except KeyError:
+                father_ids.append(-1)
+            # intersect_with_answer.append(1 if tid in example.intersect_with_answer else 0)
+            _tid2ind[tid] = len(node_spans) - 1
 
         assert len(node_spans) == len(is_answer_node)
-        assert len(node_spans) == len(intersect_with_answer)
+        # assert len(node_spans) == len(intersect_with_answer)
+        assert len(node_spans) == len(father_ids)
 
         tok_start_position = None    # answer在all_doc_tokens中的起始位置
         tok_end_position = None      # answer在all_doc_tokens中的终止位置
@@ -785,9 +801,10 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length, doc_stride
                     xpath_subs_seq=xpath_subs_seq,
                     node_spans=node_spans,
                     is_answer_node=is_answer_node,
-                    intersect_with_answer=intersect_with_answer,
+                    # intersect_with_answer=intersect_with_answer,
                     query_span=query_span,
-                    node_levels=example.node_levels,
+                    # node_levels=example.node_levels,
+                    father_ids=father_ids,
                 ))
             unique_id += 1
 

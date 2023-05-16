@@ -22,6 +22,7 @@ import torch.utils.checkpoint
 from torch import nn
 from torch.nn import CrossEntropyLoss, BCEWithLogitsLoss
 import torch.nn.functional as F
+import torch.nn.init as init
 
 from transformers.activations import ACT2FN
 from transformers.file_utils import add_start_docstrings, add_start_docstrings_to_model_forward, \
@@ -1387,17 +1388,21 @@ class MarkupLMForQuestionAnswering_true_removal(MarkupLMPreTrainedModel):
             return start_logits, end_logits
 
 
+
+'''
 class MarkupLMForQuestionAnswering_node_removal(MarkupLMPreTrainedModel):
 
     def __init__(self, config):
         super().__init__(config)
         self.config = config
         self.markuplm = MarkupLMModel(config, add_pooling_layer=False)
-        # node removal layer
+        # node removal layer: this component will give a score for each node to measure how informative it is for answering the question.
         self.node_removal_layer = nn.Sequential(
-            nn.Linear(config.hidden_size*2, config.hidden_size),
+            nn.Linear(config.hidden_size*2, config.hidden_size),    # 0
             nn.GELU(),
-            nn.Linear(config.hidden_size, 1),
+            nn.Linear(config.hidden_size, config.hidden_size),      # 2
+            nn.GELU(),
+            nn.Linear(config.hidden_size, 1),                       # 4
         )
         # qa output
         self.qa_outputs = nn.Linear(config.hidden_size, 2)
@@ -1425,6 +1430,8 @@ class MarkupLMForQuestionAnswering_node_removal(MarkupLMPreTrainedModel):
             xpath_subs_seq=None,
             query_span=None,
             node_spans=None,
+            num_nodes=None,
+            constraints=None,
     ):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
@@ -1478,31 +1485,30 @@ class MarkupLMForQuestionAnswering_node_removal(MarkupLMPreTrainedModel):
             hidden_states = layer_outputs[0]
         # node removal
         batch_size = node_spans.size(0)
-        num_nodes = node_spans.size(1)
+        max_num_nodes = node_spans.size(1)
         query_rep = []
         node_reps = []
         for b in range(batch_size):
             # 当前case的query embeddings: [dim]
-            query_rep_case = hidden_states[b, query_span[b,0]:query_span[b,1]].mean(dim=0)
-            query_rep.append(query_rep_case)
-            # 当前case的节点数和spans
-            # num_nodes_case = num_nodes[b].item()
-            node_spans_case = node_spans[b]    # [num_nodes * 2]
-            # 当前case的所有nodes的embedings: [num_nodes * dim]
-            node_reps_case = torch.stack([hidden_states[b, sp[0]:sp[1]].mean(dim=0) for sp in node_spans[b]], dim=0)
-            # print (max_num_nodes, node_reps_case.shape)
-            node_reps.append(node_reps_case)
+            query_rep.append(hidden_states[b, query_span[b,0]:query_span[b,1]].mean(dim=0))
+            # 当前case的所有nodes的embedings: [max_num_nodes * dim]
+            node_reps.append(
+                torch.stack(
+                    [hidden_states[b, sp[0]:sp[1]].mean(dim=0) for sp in node_spans[b,:num_nodes[b]]] + \
+                    [torch.zeros(self.config.hidden_size, device=device) for _ in range(max_num_nodes - num_nodes[b])], dim=0))
         # query_rep: [batch_size * dim] & node_reps: [batch_size * max_num_nodes * dim]
         query_rep = torch.stack(query_rep, dim=0)
         node_reps = torch.stack(node_reps, dim=0)
         # query_node_reps: [batch_size * num_nodes * 2dim]
-        query_node_reps = torch.cat((query_rep.unsqueeze(1).repeat(1,num_nodes,1), node_reps), dim=-1)
-        # node removal layer [batch_size * num_nodes]
-        removed_nodes = self.node_removal_layer(query_node_reps).squeeze(-1) < 0
+        query_node_reps = torch.cat(
+            (query_rep.unsqueeze(1).repeat(1, max_num_nodes, 1), node_reps), dim=-1)
+        # node removal layer [batch_size * max_num_nodes]
+        node_scores = self.node_removal_layer(query_node_reps).squeeze(-1)
+        removed_nodes = node_scores < 0
         # make mask
         removal_mask = torch.ones(input_shape, device=device)
         for i in range(batch_size):
-            for j in range(num_nodes):
+            for j in range(num_nodes[i]):
                 if removed_nodes[i,j]:
                     removal_mask[i, node_spans[i,j,0]:node_spans[i,j,1]] = 0
         attention_mask_after_removal = removal_mask * attention_mask
@@ -1526,8 +1532,8 @@ class MarkupLMForQuestionAnswering_node_removal(MarkupLMPreTrainedModel):
 
         # 去掉padding和remove的节点
         tmp = attention_mask_after_removal.bool()
-        start_logits[~tmp] = -1e6
-        end_logits[~tmp] = -1e6
+        start_logits[~tmp] = -1e3
+        end_logits[~tmp] = -1e3
         del tmp
 
         total_loss = None
@@ -1546,14 +1552,243 @@ class MarkupLMForQuestionAnswering_node_removal(MarkupLMPreTrainedModel):
             loss_fct = CrossEntropyLoss(ignore_index=ignored_index)
             start_loss = loss_fct(start_logits, start_positions)
             end_loss = loss_fct(end_logits, end_positions)
-            total_loss = (start_loss + end_loss) / 2
+            QA_loss = (start_loss + end_loss) / 2
+            # total_loss = (start_loss + end_loss) / 2
+            # node importance score regularization (tree)
+            R_tree = 0.
+            for b in range(batch_size):
+                tmp = 0.
+                for i in range(num_nodes[b]):
+                    if constraints[b,i] >= 0:
+                        tmp += F.relu(node_scores[b, i] - node_scores[b, constraints[b,i]])
+                R_tree += tmp / num_nodes[b]
+            R_tree /= batch_size
+            # 添加length regularization: 1 - 删除的比例 = 保留的比例
+            R_len = torch.mean(1. - torch.sum(1.-removal_mask, dim=1) / torch.sum(attention_mask, dim=1))
+
+            total_loss = QA_loss + 1e-3 * R_len + 1e-1 * R_tree
         
-            return  total_loss, start_logits, end_logits
+            return  total_loss, QA_loss, R_len, R_tree
+        else:
+            return start_logits, end_logits
+'''
+
+
+
+class MarkupLMForQuestionAnswering_node_removal(MarkupLMPreTrainedModel):
+    '''
+    此版本用于derivative-free optimization
+    '''
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.config = config
+        self.markuplm = MarkupLMModel(config, add_pooling_layer=False)
+        # node removal layer: this component will give a score for each node to measure how informative it is for answering the question.
+        self.node_removal_layer = nn.Sequential(
+            nn.Linear(config.hidden_size*2, config.hidden_size),       # 0
+            nn.Dropout(0.1),
+            nn.GELU(),
+            nn.Linear(config.hidden_size, config.hidden_size),      # 3
+            nn.Dropout(0.1),
+            nn.GELU(),
+            nn.Linear(config.hidden_size, 1),                # 6
+        )
+
+
+        # qa output
+        self.qa_outputs = nn.Linear(config.hidden_size, 2)
+        self.init_weights()
+
+
+    def extend_attention_mask(self, attention_mask):
+        extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+        extended_attention_mask = extended_attention_mask.to(dtype=self.dtype)
+        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
+    
+
+    def make_removal_mask(self, A, B, seq_len):
+        '''
+        A is a tensor with shape [batch size, num nodes], which entries are either 0 or 1.
+        B is a nonnegative integer tensor with shape [batch size, num nodes, 2] such that 0 <= B[i,j,0] < B[i,j,1] < seq len.
+        C which shape [batch size, seq len] such that C[i, B[i,j,0]:B[i,j,1]] = 0 if A[i,j]=1 and other entries of C is equal to 1. 
+        '''
+        # Expand dimensions to match the shape of C
+        A_expanded = A.unsqueeze(2)  # shape: [batch_size, num_nodes, 1]
+        B_start = B[:, :, 0].unsqueeze(2)  # shape: [batch_size, num_nodes, 1]
+        B_end = B[:, :, 1].unsqueeze(2)  # shape: [batch_size, num_nodes, 1]
+
+        # Create a mask to identify the ranges to be set to 0
+        mask = (torch.arange(seq_len, device=A.device).unsqueeze(0).unsqueeze(1) >= B_start) & \
+            (torch.arange(seq_len, device=A.device).unsqueeze(0).unsqueeze(1) < B_end)
+
+        # Set the ranges to 0 where A equals 1
+        C = (1 - A_expanded * mask.float()).prod(dim=1)
+
+        return C
+
+
+    def forward(
+            self,
+            input_ids=None,
+            attention_mask=None,
+            token_type_ids=None,
+            position_ids=None,
+            head_mask=None,
+            inputs_embeds=None,
+            start_positions=None,
+            end_positions=None,
+            return_dict=None,
+            xpath_tags_seq=None,
+            xpath_subs_seq=None,
+            query_span=None,
+            node_spans=None,
+            num_nodes=None,
+            constraints=None,
+    ):
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if input_ids is not None and inputs_embeds is not None:
+            raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
+        elif input_ids is not None:
+            input_shape = input_ids.size()
+        elif inputs_embeds is not None:
+            input_shape = inputs_embeds.size()[:-1]
+        else:
+            raise ValueError("You have to specify either input_ids or inputs_embeds")
+
+        device = input_ids.device if input_ids is not None else inputs_embeds.device
+
+        if attention_mask is None:
+            attention_mask = torch.ones(input_shape, device=device)
+
+        if token_type_ids is None:
+            token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=device)
+
+        # set head mask
+        if head_mask is not None:
+            if head_mask.dim() == 1:
+                head_mask = head_mask.unsqueeze(0).unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+                head_mask = head_mask.expand(self.config.num_hidden_layers, -1, -1, -1, -1)
+            elif head_mask.dim() == 2:
+                head_mask = head_mask.unsqueeze(1).unsqueeze(-1).unsqueeze(-1)
+            head_mask = head_mask.to(dtype=next(self.parameters()).dtype)
+        else:
+            head_mask = [None] * self.config.num_hidden_layers
+
+        # Build the forward prop
+        # embedding layer
+        hidden_states = self.markuplm.embeddings(
+            input_ids=input_ids,
+            xpath_tags_seq=xpath_tags_seq,
+            xpath_subs_seq=xpath_subs_seq,
+            position_ids=position_ids,
+            token_type_ids=token_type_ids,
+            inputs_embeds=inputs_embeds,
+        )
+        # first six self-attention layers
+        extend_attention_mask = self.extend_attention_mask(attention_mask)
+        for i, layer_module in enumerate(self.markuplm.encoder.layer[:self.config.num_hidden_layers//2]):
+            layer_head_mask = head_mask[i] if head_mask is not None else None
+            layer_outputs = layer_module(
+                hidden_states,
+                attention_mask=extend_attention_mask,
+                head_mask=layer_head_mask,
+            )
+            hidden_states = layer_outputs[0]
+        
+        # node removal
+        batch_size = node_spans.size(0)
+
+        # query representation
+        _idx = torch.arange(input_shape[1], device=device).unsqueeze(0)
+        _mask = (_idx >= query_span[:, 0].unsqueeze(1)) & (_idx < query_span[:, 1].unsqueeze(1))
+        _mask = _mask.float().unsqueeze(-1)
+        query_rep = (_mask * hidden_states).sum(dim=1) / _mask.sum(dim=1)
+        
+        # node repesentation
+        _start = node_spans[:, :, 0].unsqueeze(-1)  # shape: (batch_size, num_nodes, 1)
+        _end = node_spans[:, :, 1].unsqueeze(-1)  # shape: (batch_size, num_nodes, 1)
+        _index = torch.arange(input_shape[1], device=query_span.device).unsqueeze(0).unsqueeze(0)  # shape: (1, 1, seq_len)
+        _mask = (_index >= _start) & (_index < _end)  # shape: (batch_size, num_nodes, seq_len)
+        node_reps = (hidden_states.unsqueeze(1) * _mask.unsqueeze(-1)).sum(dim=2) / (_end - _start)
+        
+        # concat query rep and node rep
+        query_node_reps = torch.cat(
+            (query_rep.unsqueeze(1).repeat(1, node_reps.size(1), 1), node_reps), dim=-1)
+        # node_scores: [batch_size * max_num_nodes]
+        node_scores = self.node_removal_layer(query_node_reps).squeeze(-1)
+        removed_nodes = (node_scores <= 0)
+        
+        # make removal mask
+        removal_mask = self.make_removal_mask(removed_nodes, node_spans, input_shape[1])
+        attention_mask_after_removal = removal_mask * attention_mask
+        
+        # last six self-attention layers
+        extend_attention_mask = self.extend_attention_mask(attention_mask_after_removal)
+        for i, layer_module in enumerate(self.markuplm.encoder.layer[self.config.num_hidden_layers//2:]):
+            i += self.config.num_hidden_layers//2
+            layer_head_mask = head_mask[i] if head_mask is not None else None
+            layer_outputs = layer_module(
+                hidden_states,
+                attention_mask=extend_attention_mask,
+                head_mask=layer_head_mask,
+            )
+            hidden_states = layer_outputs[0]
+        
+        # QA loss and train
+        logits = self.qa_outputs(hidden_states)
+        start_logits, end_logits = logits.split(1, dim=-1)
+        start_logits = start_logits.squeeze(-1).contiguous()
+        end_logits = end_logits.squeeze(-1).contiguous()
+
+        # 去掉padding和remove的节点
+        tmp = attention_mask_after_removal.bool()
+        start_logits[~tmp] = -20.
+        end_logits[~tmp] = -20.
+        del tmp
+
+        total_loss = None
+        if start_positions is not None and end_positions is not None:
+            # If we are on multi-GPU, split add a dimension
+            if len(start_positions.size()) > 1:
+                start_positions = start_positions.squeeze(-1)
+            if len(end_positions.size()) > 1:
+                end_positions = end_positions.squeeze(-1)
+            # sometimes the start/end positions are outside our model inputs, we ignore these terms
+            ignored_index = start_logits.size(1)
+            start_positions.clamp_(0, ignored_index)
+            end_positions.clamp_(0, ignored_index)
+
+            # 排除padding和removal位置的logits
+            loss_fct = CrossEntropyLoss(ignore_index=ignored_index)
+            start_loss = loss_fct(start_logits, start_positions)
+            end_loss = loss_fct(end_logits, end_positions)
+            QA_loss = (start_loss + end_loss) / 2
+
+            # node importance score regularization (tree)
+            R_tree = 0.
+            for b in range(batch_size):
+                tmp = 0.
+                for i in range(num_nodes[b]):
+                    if constraints[b,i] >= 0:
+                        tmp += F.relu(node_scores[b, i] - node_scores[b, constraints[b,i]])
+                R_tree += tmp / num_nodes[b]
+            R_tree /= batch_size
+
+            # 添加length regularization: 1 - 删除的比例 = 保留的比例
+            R_len = torch.mean(1. - torch.sum(1.-removal_mask, dim=1) / torch.sum(attention_mask, dim=1))
+
+            total_loss = QA_loss + 5e-2 * R_len + 1e-1 * R_tree
+            return  total_loss, QA_loss, R_len, R_tree
         else:
             return start_logits, end_logits
 
 
 class MarkupLMForQuestionAnswering_node_removal_v2(MarkupLMPreTrainedModel):
+    '''
+    intersect with answer node + nodes without intersection removal
+    '''
 
     def __init__(self, config):
         super().__init__(config)
@@ -1745,3 +1980,418 @@ class MarkupLMForQuestionAnswering_node_removal_v2(MarkupLMPreTrainedModel):
         else:
             return start_logits, end_logits
 
+
+
+
+class MarkupLMForQuestionAnswering_node_removal_v3(MarkupLMPreTrainedModel):
+    '''
+    Webpage segmentation + Gumbel-softmax trick
+    1. 将一个HTML document分割成若干不相交的部分
+    2. 判断每个部分是否需要冗余
+    3. 用Gumbel-softmax trick进行删除操作
+    '''
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.config = config
+        self.markuplm = MarkupLMModel(config, add_pooling_layer=False)
+        # node removal layer: this component will give a score for each node to measure how informative it is for answering the question.
+        self.node_removal_layer = nn.Sequential(
+            nn.Linear(config.hidden_size*2, config.hidden_size),
+            nn.Dropout(0.2),
+            nn.GELU(),
+            nn.Linear(config.hidden_size, 1),
+        )
+
+        # qa output
+        self.qa_outputs = nn.Linear(config.hidden_size, 2)
+        self.init_weights()
+        self.init_node_removal_layer()
+
+
+    def init_node_removal_layer(self):
+        for layer in self.node_removal_layer:
+            if isinstance(layer, nn.Linear):
+                init.kaiming_uniform_(layer.weight)
+                init.zeros_(layer.bias)
+
+
+    def extend_attention_mask(self, attention_mask):
+        extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+        extended_attention_mask = extended_attention_mask.to(dtype=self.dtype)
+        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
+    
+
+    def make_removal_mask(self, A, B, seq_len):
+        '''
+        A is a tensor with shape [batch size, num nodes], which entries are either 0 or 1.
+        B is a nonnegative integer tensor with shape [batch size, num nodes, 2] such that 0 <= B[i,j,0] < B[i,j,1] < seq len.
+        C which shape [batch size, seq len] such that C[i, B[i,j,0]:B[i,j,1]] = 0 if A[i,j]=1 and other entries of C is equal to 1. 
+        '''
+        # Expand dimensions to match the shape of C
+        A_expanded = A.unsqueeze(2)  # shape: [batch_size, num_nodes, 1]
+        B_start = B[:, :, 0].unsqueeze(2)  # shape: [batch_size, num_nodes, 1]
+        B_end = B[:, :, 1].unsqueeze(2)  # shape: [batch_size, num_nodes, 1]
+
+        # Create a mask to identify the ranges to be set to 0
+        mask = (torch.arange(seq_len, device=A.device).unsqueeze(0).unsqueeze(1) >= B_start) & \
+            (torch.arange(seq_len, device=A.device).unsqueeze(0).unsqueeze(1) < B_end)
+
+        # Set the ranges to 0 where A equals 1
+        C = (1 - A_expanded * mask.float()).prod(dim=1)
+
+        return C
+
+
+    def forward(
+            self,
+            input_ids=None,
+            attention_mask=None,
+            token_type_ids=None,
+            position_ids=None,
+            head_mask=None,
+            inputs_embeds=None,
+            start_positions=None,
+            end_positions=None,
+            return_dict=None,
+            xpath_tags_seq=None,
+            xpath_subs_seq=None,
+            query_span=None,
+            node_spans=None,
+            num_nodes=None,
+            constraints=None,
+            temperature=1.,
+    ):
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if input_ids is not None and inputs_embeds is not None:
+            raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
+        elif input_ids is not None:
+            input_shape = input_ids.size()
+        elif inputs_embeds is not None:
+            input_shape = inputs_embeds.size()[:-1]
+        else:
+            raise ValueError("You have to specify either input_ids or inputs_embeds")
+
+        device = input_ids.device if input_ids is not None else inputs_embeds.device
+
+        if attention_mask is None:
+            attention_mask = torch.ones(input_shape, device=device)
+
+        if token_type_ids is None:
+            token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=device)
+
+        # set head mask
+        if head_mask is not None:
+            if head_mask.dim() == 1:
+                head_mask = head_mask.unsqueeze(0).unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+                head_mask = head_mask.expand(self.config.num_hidden_layers, -1, -1, -1, -1)
+            elif head_mask.dim() == 2:
+                head_mask = head_mask.unsqueeze(1).unsqueeze(-1).unsqueeze(-1)
+            head_mask = head_mask.to(dtype=next(self.parameters()).dtype)
+        else:
+            head_mask = [None] * self.config.num_hidden_layers
+
+        # Build the forward prop
+        # embedding layer
+        hidden_states = self.markuplm.embeddings(
+            input_ids=input_ids,
+            xpath_tags_seq=xpath_tags_seq,
+            xpath_subs_seq=xpath_subs_seq,
+            position_ids=position_ids,
+            token_type_ids=token_type_ids,
+            inputs_embeds=inputs_embeds,
+        )
+        # first six self-attention layers
+        extend_attention_mask = self.extend_attention_mask(attention_mask)
+        for i, layer_module in enumerate(self.markuplm.encoder.layer[:self.config.num_hidden_layers//2]):
+            layer_head_mask = head_mask[i] if head_mask is not None else None
+            layer_outputs = layer_module(
+                hidden_states,
+                attention_mask=extend_attention_mask,
+                head_mask=layer_head_mask,
+            )
+            hidden_states = layer_outputs[0]
+        
+        # node removal
+        batch_size = node_spans.size(0)
+
+        # query representation
+        _idx = torch.arange(input_shape[1], device=device).unsqueeze(0)
+        _mask = (_idx >= query_span[:, 0].unsqueeze(1)) & (_idx < query_span[:, 1].unsqueeze(1))
+        _mask = _mask.float().unsqueeze(-1)
+        query_rep = (_mask * hidden_states).sum(dim=1) / _mask.sum(dim=1)
+        
+        # node repesentation
+        _start = node_spans[:, :, 0].unsqueeze(-1)  # shape: (batch_size, num_nodes, 1)
+        _end = node_spans[:, :, 1].unsqueeze(-1)  # shape: (batch_size, num_nodes, 1)
+        _index = torch.arange(input_shape[1], device=query_span.device).unsqueeze(0).unsqueeze(0)  # shape: (1, 1, seq_len)
+        _mask = (_index >= _start) & (_index < _end)  # shape: (batch_size, num_nodes, seq_len)
+        node_reps = (hidden_states.unsqueeze(1) * _mask.unsqueeze(-1)).sum(dim=2) / (_end - _start)
+        
+        # concat query rep and node rep
+        query_node_reps = torch.cat(
+            (query_rep.unsqueeze(1).repeat(1, node_reps.size(1), 1), node_reps), dim=-1)
+        # node_scores: [batch_size, max_num_nodes]
+        node_scores = self.node_removal_layer(query_node_reps)
+        removed_nodes = 1. - F.gumbel_softmax(
+            torch.cat((torch.zeros_like(node_scores), node_scores), dim=-1), tau=temperature, hard=True)[:,:,1]
+        node_scores = node_scores.squeeze(-1)
+        
+        # make removal mask
+        removal_mask = self.make_removal_mask(removed_nodes, node_spans, input_shape[1])
+        attention_mask_after_removal = removal_mask * attention_mask
+        
+        # last six self-attention layers
+        extend_attention_mask = self.extend_attention_mask(attention_mask_after_removal)
+        for i, layer_module in enumerate(self.markuplm.encoder.layer[self.config.num_hidden_layers//2:]):
+            i += self.config.num_hidden_layers//2
+            layer_head_mask = head_mask[i] if head_mask is not None else None
+            layer_outputs = layer_module(
+                hidden_states,
+                attention_mask=extend_attention_mask,
+                head_mask=layer_head_mask,
+            )
+            hidden_states = layer_outputs[0]
+        
+        # QA loss and train
+        logits = self.qa_outputs(hidden_states)
+        start_logits, end_logits = logits.split(1, dim=-1)
+        start_logits = start_logits.squeeze(-1).contiguous()
+        end_logits = end_logits.squeeze(-1).contiguous()
+
+        # 去掉padding和remove的节点
+        tmp = attention_mask_after_removal.bool()
+        start_logits[~tmp] = -100.
+        end_logits[~tmp] = -100.
+        del tmp
+
+        total_loss = None
+        if start_positions is not None and end_positions is not None:
+            # If we are on multi-GPU, split add a dimension
+            if len(start_positions.size()) > 1:
+                start_positions = start_positions.squeeze(-1)
+            if len(end_positions.size()) > 1:
+                end_positions = end_positions.squeeze(-1)
+            # sometimes the start/end positions are outside our model inputs, we ignore these terms
+            ignored_index = start_logits.size(1)
+            start_positions.clamp_(0, ignored_index)
+            end_positions.clamp_(0, ignored_index)
+
+            # 排除padding和removal位置的logits
+            loss_fct = CrossEntropyLoss(ignore_index=ignored_index)
+            start_loss = loss_fct(start_logits, start_positions)
+            end_loss = loss_fct(end_logits, end_positions)
+            QA_loss = (start_loss + end_loss) / 2
+
+            # node importance score regularization (tree)
+            R_tree = 0.
+            for b in range(batch_size):
+                tmp = 0.
+                for i in range(num_nodes[b]):
+                    if constraints[b,i] >= 0:
+                        tmp += F.relu(node_scores[b, i] - node_scores[b, constraints[b,i]])
+                R_tree += tmp / num_nodes[b]
+            R_tree /= batch_size
+
+            # 添加length regularization: 1 - 删除的比例 = 保留的比例
+            R_len = torch.mean(1. - torch.sum(1.-removal_mask, dim=1) / torch.sum(attention_mask, dim=1))
+
+            total_loss = QA_loss + 1e-3 * R_len + 1e-2 * R_tree
+            return  total_loss, QA_loss, R_len, R_tree
+        else:
+            return start_logits, end_logits
+
+
+class MarkupLMForQuestionAnswering_node_removal_v4(MarkupLMPreTrainedModel):
+    '''
+    SIF embedding replaces mean embedding
+    CRF layer or Basyesnian network layer
+    '''
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.config = config
+        self.markuplm = MarkupLMModel(config, add_pooling_layer=False)
+        # node removal layer: this component will give a score for each node to measure how informative it is for answering the question.
+        self.node_removal_layer = nn.Sequential(
+            nn.Linear(config.hidden_size*2, config.hidden_size),    # 0
+            nn.GELU(),
+            nn.Linear(config.hidden_size, config.hidden_size),      # 2
+            nn.GELU(),
+            nn.Linear(config.hidden_size, 1),                       # 4
+        )
+        # qa output
+        self.qa_outputs = nn.Linear(config.hidden_size, 2)
+        self.init_weights()
+
+
+    def extend_attention_mask(self, attention_mask):
+        extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+        extended_attention_mask = extended_attention_mask.to(dtype=self.dtype)
+        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
+
+
+    def forward(
+            self,
+            input_ids=None,
+            attention_mask=None,
+            token_type_ids=None,
+            position_ids=None,
+            head_mask=None,
+            inputs_embeds=None,
+            start_positions=None,
+            end_positions=None,
+            return_dict=None,
+            xpath_tags_seq=None,
+            xpath_subs_seq=None,
+            query_span=None,
+            node_spans=None,
+            num_nodes=None,
+            constraints=None,
+    ):
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if input_ids is not None and inputs_embeds is not None:
+            raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
+        elif input_ids is not None:
+            input_shape = input_ids.size()
+        elif inputs_embeds is not None:
+            input_shape = inputs_embeds.size()[:-1]
+        else:
+            raise ValueError("You have to specify either input_ids or inputs_embeds")
+
+        device = input_ids.device if input_ids is not None else inputs_embeds.device
+
+        if attention_mask is None:
+            attention_mask = torch.ones(input_shape, device=device)
+
+        if token_type_ids is None:
+            token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=device)
+
+        # set head mask
+        if head_mask is not None:
+            if head_mask.dim() == 1:
+                head_mask = head_mask.unsqueeze(0).unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+                head_mask = head_mask.expand(self.config.num_hidden_layers, -1, -1, -1, -1)
+            elif head_mask.dim() == 2:
+                head_mask = head_mask.unsqueeze(1).unsqueeze(-1).unsqueeze(-1)
+            head_mask = head_mask.to(dtype=next(self.parameters()).dtype)
+        else:
+            head_mask = [None] * self.config.num_hidden_layers
+
+        # Build the forward prop
+        # embedding layer
+        hidden_states = self.markuplm.embeddings(
+            input_ids=input_ids,
+            xpath_tags_seq=xpath_tags_seq,
+            xpath_subs_seq=xpath_subs_seq,
+            position_ids=position_ids,
+            token_type_ids=token_type_ids,
+            inputs_embeds=inputs_embeds,
+        )
+        # first six self-attention layers
+        extend_attention_mask = self.extend_attention_mask(attention_mask)
+        for i, layer_module in enumerate(self.markuplm.encoder.layer[:self.config.num_hidden_layers//2]):
+            layer_head_mask = head_mask[i] if head_mask is not None else None
+            layer_outputs = layer_module(
+                hidden_states,
+                attention_mask=extend_attention_mask,
+                head_mask=layer_head_mask,
+            )
+            hidden_states = layer_outputs[0]
+        # node removal
+        batch_size = node_spans.size(0)
+        max_num_nodes = node_spans.size(1)
+
+        # query representation
+        _idx = torch.arange(input_shape[1], device=query_span.device).unsqueeze(0)
+        _mask = (_idx >= query_span[:, 0].unsqueeze(1)) & (_idx < query_span[:, 1].unsqueeze(1))
+        _mask = _mask.float().unsqueeze(-1)
+        query_rep = (_mask * hidden_states).sum(dim=1) / _mask.sum(dim=1)
+        
+        # node repesentation
+        _start = node_spans[:, :, 0].unsqueeze(-1)  # shape: (batch_size, num_nodes, 1)
+        _end = node_spans[:, :, 1].unsqueeze(-1)  # shape: (batch_size, num_nodes, 1)
+        _index = torch.arange(input_shape[1], device=query_span.device).unsqueeze(0).unsqueeze(0)  # shape: (1, 1, seq_len)
+        _mask = (_index >= _start) & (_index < _end)  # shape: (batch_size, num_nodes, seq_len)
+        node_reps = (hidden_states.unsqueeze(1) * _mask.unsqueeze(-1)).sum(dim=2) / (_end - _start)
+        
+        # concat query rep and node rep
+        query_node_reps = torch.cat(
+            (query_rep.unsqueeze(1).repeat(1, max_num_nodes, 1), node_reps), dim=-1)
+        
+        # node removal layer [batch_size * max_num_nodes]
+        node_scores = self.node_removal_layer(query_node_reps).squeeze(-1)
+        # removed_nodes = node_scores <= 0
+        reserved_nodes = F.gumbel_softmax(node_scores, tau=1, hard=True)
+        
+        # make mask
+        removal_mask = torch.ones(input_shape, device=device)
+        for i in range(batch_size):
+            for j in range(num_nodes[i]):
+                if not reserved_nodes[i,j]:
+                    removal_mask[i, node_spans[i,j,0]:node_spans[i,j,1]] = 0
+        attention_mask_after_removal = removal_mask * attention_mask
+
+        # make hidden_states[i,j] = 0 if its affiliated node is removed
+        hidden_states
+        
+        # last six self-attention layers
+        extend_attention_mask = self.extend_attention_mask(attention_mask_after_removal)
+        for i, layer_module in enumerate(self.markuplm.encoder.layer[self.config.num_hidden_layers//2:]):
+            i += self.config.num_hidden_layers//2
+            layer_head_mask = head_mask[i] if head_mask is not None else None
+            layer_outputs = layer_module(
+                hidden_states,
+                attention_mask=extend_attention_mask,
+                head_mask=layer_head_mask,
+            )
+            hidden_states = layer_outputs[0]
+        
+        # QA loss and train
+        logits = self.qa_outputs(hidden_states)
+        start_logits, end_logits = logits.split(1, dim=-1)
+        start_logits = start_logits.squeeze(-1).contiguous()
+        end_logits = end_logits.squeeze(-1).contiguous()
+
+        # 去掉padding和remove的节点
+        tmp = attention_mask_after_removal.bool()
+        start_logits[~tmp] = -1e2
+        end_logits[~tmp] = -1e2
+        del tmp
+
+        total_loss = None
+        if start_positions is not None and end_positions is not None:
+            # If we are on multi-GPU, split add a dimension
+            if len(start_positions.size()) > 1:
+                start_positions = start_positions.squeeze(-1)
+            if len(end_positions.size()) > 1:
+                end_positions = end_positions.squeeze(-1)
+            # sometimes the start/end positions are outside our model inputs, we ignore these terms
+            ignored_index = start_logits.size(1)
+            start_positions.clamp_(0, ignored_index)
+            end_positions.clamp_(0, ignored_index)
+
+            # 排除padding和removal位置的logits
+            loss_fct = CrossEntropyLoss(ignore_index=ignored_index)
+            start_loss = loss_fct(start_logits, start_positions)
+            end_loss = loss_fct(end_logits, end_positions)
+            QA_loss = (start_loss + end_loss) / 2
+            # node importance score regularization (tree)
+            R_tree = 0.
+            for b in range(batch_size):
+                tmp = 0.
+                for i in range(num_nodes[b]):
+                    if constraints[b,i] >= 0:
+                        tmp += F.relu(node_scores[b, i] - node_scores[b, constraints[b,i]])
+                R_tree += tmp / num_nodes[b]
+            R_tree /= batch_size
+            # 添加length regularization: 1 - 删除的比例 = 保留的比例
+            R_len = torch.mean(1. - torch.sum(1.-removal_mask, dim=1) / torch.sum(attention_mask, dim=1))
+
+            total_loss = QA_loss + 1e-2 * R_len + 1e-1 * R_tree
+        
+            return  total_loss, QA_loss, R_len, R_tree
+        else:
+            return start_logits, end_logits

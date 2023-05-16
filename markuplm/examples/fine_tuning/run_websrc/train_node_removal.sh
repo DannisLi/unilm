@@ -1,14 +1,19 @@
-CUDA_VISIBLE_DEVICES=2,3 python run_node_removal.py \
-	--train_file /home/v-lizimeng/data/WebSRC/websrc1.0_train_.json \
-	--root_dir /home/v-lizimeng/data/WebSRC \
-	--model_name_or_path microsoft/markuplm-base \
-	--output_dir /home/v-lizimeng/unilm/markuplm/examples/fine_tuning/run_websrc/results_node_removal_2 \
-	--do_train \
-	--save_steps 1000 \
-	--max_query_length 42 \
-	--max_seq_length 512 \
-	--learning_rate 1e-5 \
-	--per_gpu_train_batch_size 8 \
-	--warmup_ratio 0.1 \
-	--num_train_epochs 5 \
-	--max_num_nodes 98
+CUDA_VISIBLE_DEVICES=0,1,2,3 python run_node_removal_v3.py \
+    --train_file /home/v-lizimeng/data/WebSRC/websrc1.0_train_.json \
+    --root_dir /home/v-lizimeng/data/WebSRC \
+    --model_name_or_path microsoft/markuplm-base \
+    --output_dir /home/v-lizimeng/unilm/markuplm/examples/fine_tuning/run_websrc/results_node_removal_RSPSO_0508 \
+    --do_train \
+    --save_steps 1000 \
+    --max_query_length 42 \
+    --max_seq_length 512 \
+    --learning_rate 1e-5 \
+    --per_gpu_train_batch_size 4 \
+    --warmup_ratio 0.1 \
+    --num_train_epochs 5 \
+    --max_num_nodes 72 \
+    --ng_optimizer RealSpacePSO \
+    --per_gpu_ng_batch_size 8 \
+    --ng_steps 16 \
+    --dataloader_workers 36 \
+    --ng_num_workers 8
